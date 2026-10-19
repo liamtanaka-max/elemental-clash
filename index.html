@@ -3941,6 +3941,8 @@ class Match {
     const alive = this.fighters.filter(f => f.stocks > 0);
     const result = {
       online: this.online,
+      stage: this.stage.id,
+      frames: this.timer,                            // how long the match lasted (60 per second)
       winner: alive.length === 1 ? alive[0].index : -1,
       players: this.fighters.map(f => ({ id: f.id, palette: f.palette, name: f.def.name, stats: Object.assign({}, f.stats), stocks: f.stocks })),
     };
@@ -4743,6 +4745,8 @@ SCREENS.fight = {
 SCREENS.results = {
   enter() {
     this.t = 0;
+    // save the match to the online database (online games: only the host saves it, so it isn't saved twice)
+    if (!Game.lastResult.online || Net.isHost) saveMatchResult(Game.lastResult);
     if (Game.lastResult.online) {
       this.menu = new Menu([
         { label: 'BACK TO ROOM', x: 390, y: 630, w: 260, h: 60, action: () => Game.setScreen('onlineLobby') },
@@ -5276,6 +5280,43 @@ const Net = {
     delete this.sums[frame];
   },
 };
+
+// ---------------------------------------------------------------------
+// SAVING MATCH RESULTS to a Supabase database (supabase.com).
+// After every match the results are sent to the "matches" table with one
+// web request (no library needed). The key below is a PUBLIC key: the
+// database only lets it ADD rows to "matches" - it can't read, change or
+// delete anything - so it's safe to have in the page. If the request
+// fails (offline, database paused...) the game just carries on.
+// ---------------------------------------------------------------------
+const SUPABASE_URL = 'https://aehyljylidmxvszgzfmd.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_CGcV_jwFdpUqK4bAm0jdEg_MAl65IQo';
+const GAME_VERSION = 3;          // bump when the game changes, so results from different versions can be told apart
+
+function saveMatchResult(r) {
+  if (typeof fetch === 'undefined') return;
+  const [a, b] = r.players;
+  const row = {
+    mode: r.online ? 'online' : 'local',
+    stage: r.stage,
+    p1_fighter: a.id, p2_fighter: b.id,
+    winner: r.winner,                                // 0 = P1, 1 = P2, -1 = draw
+    p1_stocks: a.stocks, p2_stocks: b.stocks,
+    p1_kos: a.stats.kos, p2_kos: b.stats.kos,
+    p1_falls: a.stats.falls, p2_falls: b.stats.falls,
+    p1_damage: Math.round(a.stats.damageDealt), p2_damage: Math.round(b.stats.damageDealt),
+    duration_seconds: Math.round(r.frames / 60),
+    game_version: GAME_VERSION,
+  };
+  try {
+    fetch(SUPABASE_URL + '/rest/v1/matches', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', apikey: SUPABASE_KEY, Prefer: 'return=minimal' },
+      body: JSON.stringify(row),
+    }).then(res => { if (!res.ok) console.warn('Could not save the match result (' + res.status + ')'); },
+            () => console.warn('Could not save the match result (offline?)'));
+  } catch (err) { /* never let saving break the game */ }
+}
 
 // Pasting a room code (Ctrl+V) on the Join screen.
 window.addEventListener('paste', e => {

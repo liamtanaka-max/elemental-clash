@@ -1,12 +1,16 @@
 # Elemental Clash
 
+### ▶ Play now: **https://liamtanaka-max.github.io/elemental-clash/**
+
+No download needed — open the link in any modern browser (Chrome, Edge, Firefox). Send it to a friend to play online together.
+
 A 2-player platform fighter that runs in your browser — on one keyboard, or **online with a room code**. Five elemental fighters, three stages, three stocks each. The higher your damage %, the farther you fly — knock your rival past the edge of the screen to take a stock.
 
 Everything — characters, stage, effects and sound — is drawn and synthesized with code. No images, no audio files. Just one HTML file (online play loads one small library, [PeerJS](https://peerjs.com/), to connect the two browsers).
 
 ## Play
 
-- **Online:** https://liamtanaka-max.github.io/elemental-clash/ (once GitHub Pages is enabled: Settings → Pages → Deploy from branch `main`, folder `/ (root)`)
+- **In your browser:** https://liamtanaka-max.github.io/elemental-clash/
 - **Locally:** download `index.html` and double-click it.
 
 ## Online play
@@ -26,6 +30,17 @@ How it works: the two browsers connect directly with WebRTC (PeerJS's free serve
 | **Elemental Shrine** | Balanced: a floating temple with three platforms |
 | **Magma Forge** | A long iron bridge over lava with two low grates — lots of room to fight |
 | **Storm Spire** | A tiny peak in a thunderstorm, with platforms hanging past the edges — early KOs |
+
+## Match data (Supabase)
+
+Every finished match is saved to a [Supabase](https://supabase.com) database (table `matches`): mode (local/online), stage, both fighters, winner, stocks left, KOs, falls, damage dealt, match length and game version. Online matches are saved once, by the host.
+
+The page uses Supabase's **public** key, and the database only allows that key to *add* rows to `matches` — it can't read, change or delete anything. To look at the data, open the Supabase dashboard → Table Editor → `matches` (or the SQL editor), e.g.
+
+```sql
+select p1_fighter as fighter, count(*) filter (where winner = 0) as wins, count(*) as games
+from matches group by 1 order by wins desc;
+```
 
 ## Fighters
 
