@@ -4853,6 +4853,19 @@ const CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';    // no O/0 or I/1 - t
 const CODE_LENGTH = 5;
 const NET_TIMEOUT_MS = 10000;                               // nothing heard for this long = connection lost
 const NET_CONNECT_TIMEOUT_MS = 15000;                       // give up joining after this long
+const NET_BLOCKED_MSG = "Found the room, but couldn't link to your friend's computer. A network is blocking it - try another Wi-Fi or a hotspot.";
+// How two computers find each other:
+//   STUN servers tell each computer its public internet address, which is
+//   enough for most home networks to connect directly.
+//   TURN servers (a "relay") pass the game data along when the networks
+//   won't allow a direct link (some routers, school Wi-Fi, phone hotspots).
+const STUN_SERVERS = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+];
+// Relay: paste a metered.ca "TURN credentials" URL here (free account) to
+// turn it on, e.g. 'https://YOURAPP.metered.live/api/v1/turn/credentials?apiKey=...'
+const TURN_CREDENTIALS_URL = '';
 const MAX_PREDICT = 12;           // never guess more than this many frames ahead (then wait for the rival)
 
 function makeRoomCode() {
@@ -4952,7 +4965,10 @@ const Net = {
   latch: 0, stall: 0, tickCount: 0, rollbacks: 0,
   sums: {}, sumEvery: 60, desync: false, menuOpen: false,
 
+  iceServers: STUN_SERVERS,  // + relay servers, if TURN_CREDENTIALS_URL is set (loaded below)
+
   get localIndex() { return this.isHost ? 0 : 1; },
+  peerOptions() { return { config: { iceServers: this.iceServers } }; },
   available() { return typeof Peer !== 'undefined'; },
 
   // ------------------------------------------------ CREATE / JOIN A ROOM
@@ -4966,7 +4982,7 @@ const Net = {
     this.isHost = true;
     this.code = makeRoomCode();
     this.status = 'Creating room...';
-    const peer = this.peer = new Peer(NET_ROOM_PREFIX + this.code);
+    const peer = this.peer = new Peer(NET_ROOM_PREFIX + this.code, this.peerOptions());
     peer.on('open', () => { if (peer === this.peer) { this.peerOpen = true; this.status = 'Waiting for your friend to join...'; } });
     peer.on('connection', conn => {
       if (peer !== this.peer) return;
@@ -4984,7 +5000,7 @@ const Net = {
     this.code = code;
     this.status = 'Connecting to room ' + code + '...';
     this.connectStart = performance.now();
-    const peer = this.peer = new Peer();
+    const peer = this.peer = new Peer(this.peerOptions());
     peer.on('open', () => {
       if (peer !== this.peer) return;
       this.peerOpen = true;
@@ -5015,7 +5031,7 @@ const Net = {
     conn.on('data', msg => { if (conn === this.conn) this.receive(msg); });
     conn.on('iceStateChanged', state => {           // the two computers couldn't reach each other
       if (conn === this.conn && !this.connected && state === 'failed') {
-        this.fail("Couldn't connect to your friend's computer. Try again, or try another network.");
+        this.fail(NET_BLOCKED_MSG);
       }
     });
     conn.on('close', () => { if (conn === this.conn) this.lost('Your rival left the room.'); });
@@ -5053,7 +5069,7 @@ const Net = {
         this.sendFast({ t: 'ping', ts: now });
         if (now - this.lastHeard > NET_TIMEOUT_MS) this.lost('Lost the connection to your rival.');
       } else if (!this.isHost && this.peer && now - this.connectStart > NET_CONNECT_TIMEOUT_MS) {
-        this.fail("Couldn't connect to that room. Check the code and try again.");
+        this.fail(NET_BLOCKED_MSG);                   // the room exists (else 'peer-unavailable'), but no link
       }
     }, 1000);
   },
@@ -5316,6 +5332,14 @@ function saveMatchResult(r) {
     }).then(res => { if (!res.ok) console.warn('Could not save the match result (' + res.status + ')'); },
             () => console.warn('Could not save the match result (offline?)'));
   } catch (err) { /* never let saving break the game */ }
+}
+
+// Fetch the relay (TURN) logins once when the page loads, if a URL is set.
+if (TURN_CREDENTIALS_URL && typeof fetch !== 'undefined') {
+  fetch(TURN_CREDENTIALS_URL)
+    .then(res => res.json())
+    .then(list => { if (Array.isArray(list) && list.length) Net.iceServers = STUN_SERVERS.concat(list); })
+    .catch(() => console.warn('Could not load relay servers - online play will only use direct connections'));
 }
 
 // Pasting a room code (Ctrl+V) on the Join screen.
