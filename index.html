@@ -14,11 +14,14 @@
 </head>
 <body>
 <canvas id="game" width="1280" height="720" tabindex="0"></canvas>
+<!-- PeerJS connects two browsers directly (WebRTC) for online play.
+     It is only needed for ONLINE - local play works even if it fails to load. -->
+<script async src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
 <script>
 "use strict";
 /* =======================================================================
    ELEMENTAL CLASH
-   A 2-player local platform fighter. Damage is a percentage: the higher
+   A 2-player platform fighter (same keyboard, or online with a room code). Damage is a percentage: the higher
    it gets, the further you fly. Knock your rival past the edge of the
    screen (a "blast zone") to take one of their stocks (lives).
 
@@ -37,7 +40,8 @@
      9. Projectiles         - fireballs, bubbles, orbs...
     10. Match class         - one fight: hits, camera, HUD, KOs
     11. UI & screens        - menus, character select, results...
-    12. Main loop           - fixed 60 FPS time step
+    12. Online multiplayer  - rooms, codes and syncing two computers
+    13. Main loop           - fixed 60 FPS time step
    ======================================================================= */
 
 
@@ -48,10 +52,44 @@
 const W = 1280, H = 720;      // the game always "thinks" in 1280x720 pixels
 const STEP = 1000 / 60;       // one game update every 1/60th of a second
 const START_STOCKS = 3;       // lives per player
-const KB_DECAY = 0.45;        // launch speed lost per frame after being hit
-const HITSTUN_MULT = 2.0;     // frames of hitstun per point of knockback
-const BUFFER_FRAMES = 5;      // a button press is remembered this many frames
 const MAX_SHIELD = 60;        // shield health
+
+// ---------------------------------------------------------------------
+// TUNING: the numbers that decide how the game FEELS. Tweak away!
+// (Per-fighter speeds, gravity and jump power live in FIGHTERS below.)
+// ---------------------------------------------------------------------
+const TUNING = {
+  // movement
+  groundAccelFrames: 6,     // frames to reach full run speed
+  groundStopFrames: 4,      // frames to stop (also used when turning around)
+  airAccelFrames: 10,       // frames to reach full air speed (higher = floatier steering)
+  airStopFrames: 40,        // frames to drift to a stop in the air with no input
+  fallGravityMult: 1.35,    // gravity is this much stronger while falling (snappier arc)
+  jumpSquatFrames: 3,       // crouch before leaving the ground
+  jumpCutMult: 0.65,        // releasing jump while rising multiplies upward speed (short hop)
+  coyoteFrames: 6,          // you can still jump this long after walking off an edge
+  jumpBufferFrames: 6,      // a jump pressed this early before landing still happens
+  landingLag: 3,            // frames stuck after a normal landing
+  helplessLandingLag: 14,   // landing lag after an up special
+  substepPixels: 10,        // collision is checked every this many pixels moved
+  // combat
+  inputBufferFrames: 8,     // attacks pressed this early come out as soon as possible
+  hitstopMin: 3,            // freeze frames on a weak hit...
+  hitstopMax: 10,           // ...and on the strongest hit
+  hitstopPerDamage: 0.35,   // extra freeze frames per % of damage
+  kbDecay: 0.45,            // launch speed lost per frame after being hit
+  hitstunMult: 2.0,         // frames of hitstun per point of knockback
+  diMaxDegrees: 15,         // directional influence: how much holding a direction bends a launch
+  shieldTapFrames: 8,       // releasing the shield within this many frames = spot dodge
+  // charged attacks
+  chargeHoldMs: 150,        // hold attack longer than this to start charging
+  chargeMaxMs: 1000,        // a charge auto-releases after this long
+  chargeMaxMult: 2.0,       // damage & knockback at full charge (1.0 at minimum)
+};
+const KB_DECAY = TUNING.kbDecay;
+const HITSTUN_MULT = TUNING.hitstunMult;
+const CHARGE_HOLD_FRAMES = Math.round(TUNING.chargeHoldMs / STEP);   // 150 ms = 9 frames
+const CHARGE_MAX_FRAMES = Math.round(TUNING.chargeMaxMs / STEP);     // 1 s = 60 frames
 const PLAYER_COLORS = ['#ff4b4b', '#4b9bff'];   // P1 red, P2 blue
 const FONT = '"Trebuchet MS", "Segoe UI", Verdana, sans-serif';
 const TITLE_FONT = 'Impact, "Arial Black", "Segoe UI Black", sans-serif';
@@ -79,6 +117,10 @@ const approach = (v, target, step) => (v < target ? Math.min(v + step, target) :
 // Do two rectangles {x, y, w, h} overlap?
 const rectsOverlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 const pointInRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+// Easing curves (t goes 0..1) make animations speed up / slow down smoothly.
+const easeOutCubic = t => 1 - Math.pow(1 - t, 3);                  // fast start, gentle stop
+const easeInOutSine = t => -(Math.cos(Math.PI * t) - 1) / 2;       // slow, fast, slow
+const easeOutBack = t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2);   // overshoots a bit
 
 // Colour helper: rgba('#ff8800', 0.5) -> 'rgba(255,136,0,0.5)'
 const _rgbCache = {};
@@ -156,13 +198,90 @@ const Input = {
   anyPressed(codes) { return codes.some(c => this.pressed[c] === true); },
   endFrame() { this.pressed = {}; },       // called after every update
 };
+// Mouse buttons go through the same system as keys, as 'Mouse0' (left),
+// 'Mouse1' (middle) and 'Mouse2' (right), so they can be bound to anything.
+const isMouseCode = code => typeof code === 'string' && code.startsWith('Mouse');
 
-// Keys that would otherwise scroll the page or type characters.
-const BLOCKED_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space',
-  'Semicolon', 'Backquote', 'Quote', 'Slash', 'Tab']);
+// ----- KEY BINDINGS -----
+// Every action a player can bind. Directions never jump: only "jump" does.
+const ACTIONS = ['left', 'right', 'up', 'down', 'jump', 'attack', 'special', 'shield'];
+const ACTION_LABELS = { left: 'Left', right: 'Right', up: 'Up', down: 'Down', jump: 'Jump',
+  attack: 'Attack', special: 'Special', shield: 'Shield / Dodge' };
+const DEFAULT_CONTROLS = [
+  { left: 'KeyA', right: 'KeyD', up: 'KeyW', down: 'KeyS', jump: 'Space',
+    attack: 'Mouse0', special: 'Mouse2', shield: 'ShiftLeft' },
+  { left: 'ArrowLeft', right: 'ArrowRight', up: 'ArrowUp', down: 'ArrowDown', jump: 'Enter',
+    attack: 'Period', special: 'Slash', shield: 'ShiftRight' },
+];
+const CONTROLS_STORAGE_KEY = 'elementalClash.controls.v2';
+
+// Load saved bindings (localStorage can be blocked, so everything is in try/catch).
+function loadControls() {
+  const fresh = DEFAULT_CONTROLS.map(k => Object.assign({}, k));
+  try {
+    const saved = JSON.parse(localStorage.getItem(CONTROLS_STORAGE_KEY));
+    if (Array.isArray(saved) && saved.length === 2) {
+      saved.forEach((k, p) => ACTIONS.forEach(a => { if (k && typeof k[a] === 'string' && k[a]) fresh[p][a] = k[a]; }));
+    }
+  } catch (err) { /* no saved bindings: use the defaults */ }
+  return fresh;
+}
+function saveControls() {
+  try { localStorage.setItem(CONTROLS_STORAGE_KEY, JSON.stringify(CONTROLS)); } catch (err) { /* storage unavailable */ }
+}
+// CONTROLS[0] is Player 1's binding map, CONTROLS[1] is Player 2's.
+// ALL game input reads from here, so rebinding takes effect immediately.
+const CONTROLS = loadControls();
+
+function resetControls(p) {
+  Object.assign(CONTROLS[p], DEFAULT_CONTROLS[p]);
+  saveControls();
+}
+// Bind "code" to player p's action. If another action already uses that
+// key (for either player), the two bindings swap. Returns a message.
+function rebind(p, action, code) {
+  const old = CONTROLS[p][action];
+  let msg = 'P' + (p + 1) + ' ' + ACTION_LABELS[action] + ' is now ' + keyName(code);
+  for (let q = 0; q < 2; q++) {
+    for (const a of ACTIONS) {
+      if ((q !== p || a !== action) && CONTROLS[q][a] === code) {
+        CONTROLS[q][a] = old;
+        msg = 'Warning: ' + keyName(code) + ' was used by P' + (q + 1) + ' ' + ACTION_LABELS[a] +
+          ' - swapped, so that is now ' + keyName(old);
+      }
+    }
+  }
+  CONTROLS[p][action] = code;
+  saveControls();
+  return msg;
+}
+const isBound = code => CONTROLS.some(k => ACTIONS.some(a => k[a] === code));
+
+// Friendly names for keys and mouse buttons, shown in menus.
+const KEY_NAMES = {
+  Space: 'Space', Enter: 'Enter', NumpadEnter: 'Num Enter', ShiftLeft: 'L-Shift', ShiftRight: 'R-Shift',
+  ControlLeft: 'L-Ctrl', ControlRight: 'R-Ctrl', AltLeft: 'L-Alt', AltRight: 'R-Alt',
+  ArrowLeft: '←', ArrowRight: '→', ArrowUp: '↑', ArrowDown: '↓',
+  Period: '.', Comma: ',', Slash: '/', Semicolon: ';', Quote: "'", BracketLeft: '[', BracketRight: ']',
+  Backslash: '\\', Minus: '-', Equal: '=', Backquote: '`', Tab: 'Tab', Backspace: 'Backspace', CapsLock: 'Caps Lock',
+  Mouse0: 'Left Click', Mouse1: 'Middle Click', Mouse2: 'Right Click', Mouse3: 'Mouse Back', Mouse4: 'Mouse Fwd',
+};
+function keyName(code) {
+  if (!code) return '-';
+  if (KEY_NAMES[code]) return KEY_NAMES[code];
+  if (code.startsWith('Key')) return code.slice(3);
+  if (code.startsWith('Digit')) return code.slice(5);
+  if (code.startsWith('Numpad')) return 'Num ' + code.slice(6);
+  if (code.startsWith('Mouse')) return 'Mouse ' + (Number(code.slice(5)) + 1);
+  return code;
+}
+
+// Keys that would otherwise scroll the page, press buttons, or open quick-find.
+const BLOCKED_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Enter', 'NumpadEnter',
+  'Slash', 'Quote', 'Backquote', 'Tab', 'Semicolon']);
 
 window.addEventListener('keydown', e => {
-  if (BLOCKED_KEYS.has(e.code)) e.preventDefault();
+  if (BLOCKED_KEYS.has(e.code) || isBound(e.code)) e.preventDefault();
   if (!e.repeat) Input.pressed[e.code] = true;   // holding a key doesn't re-press it
   Input.down[e.code] = true;
   Sound.unlock();                                 // browsers need a key/click before audio
@@ -170,20 +289,14 @@ window.addEventListener('keydown', e => {
 window.addEventListener('keyup', e => { Input.down[e.code] = false; });
 window.addEventListener('blur', () => { Input.down = {}; });  // let go of everything if the tab loses focus
 
-// The keys each player uses. Change these to remap the controls.
-const CONTROLS = [
-  { left: 'KeyA', right: 'KeyD', up: 'KeyW', down: 'KeyS', attack: 'KeyF', special: 'KeyG', shield: 'KeyH' },
-  { left: 'ArrowLeft', right: 'ArrowRight', up: 'ArrowUp', down: 'ArrowDown', attack: 'KeyK', special: 'KeyL', shield: 'Semicolon' },
-];
-
-// Turns the raw keyboard into a simple object for one player.
-// "left" = held right now, "leftP" = pressed this frame.
+// Turns the raw keyboard/mouse into a simple object for one player,
+// using that player's binding map. "left" = held, "leftP" = pressed this frame.
 function readPlayerInput(k) {
   const d = code => Input.isDown(code), p = code => Input.wasPressed(code);
   return {
-    left: d(k.left), right: d(k.right), up: d(k.up), down: d(k.down),
+    left: d(k.left), right: d(k.right), up: d(k.up), down: d(k.down), jump: d(k.jump),
     attack: d(k.attack), special: d(k.special), shield: d(k.shield),
-    leftP: p(k.left), rightP: p(k.right), upP: p(k.up), downP: p(k.down),
+    leftP: p(k.left), rightP: p(k.right), upP: p(k.up), downP: p(k.down), jumpP: p(k.jump),
     attackP: p(k.attack), specialP: p(k.special), shieldP: p(k.shield),
   };
 }
@@ -192,14 +305,20 @@ const NO_INPUT = readPlayerInput({});
 // -1 = left, 1 = right, 0 = neither (or both)
 const dirOf = inp => (inp.right ? 1 : 0) - (inp.left ? 1 : 0);
 
-// Menu keys: both players' movement keys and Enter work in menus.
+// Menus: arrows/WASD/Enter/Space always work, plus each player's own
+// direction keys and (keyboard) attack key. Mouse clicks are handled by the menus.
 const MENU_KEYS = {
   up: ['KeyW', 'ArrowUp'], down: ['KeyS', 'ArrowDown'],
   left: ['KeyA', 'ArrowLeft'], right: ['KeyD', 'ArrowRight'],
-  confirm: ['Enter', 'NumpadEnter', 'Space', 'KeyF', 'KeyK'],
+  confirm: ['Enter', 'NumpadEnter', 'Space'],
   back: ['Escape', 'Backspace'],
 };
-const menuPressed = name => Input.anyPressed(MENU_KEYS[name]);
+function menuPressed(name) {
+  if (Input.anyPressed(MENU_KEYS[name])) return true;
+  const action = name === 'confirm' ? 'attack' : name;
+  if (!ACTIONS.includes(action)) return false;
+  return CONTROLS.some(k => !isMouseCode(k[action]) && Input.wasPressed(k[action]));
+}
 
 // Mouse position is converted from screen pixels to game pixels.
 const Mouse = { x: -1, y: -1, moved: false, clicked: false };
@@ -209,7 +328,17 @@ function updateMouse(e) {
   Mouse.y = (e.clientY - r.top) * H / r.height;
 }
 canvas.addEventListener('mousemove', e => { updateMouse(e); Mouse.moved = true; });
-canvas.addEventListener('mousedown', e => { updateMouse(e); Mouse.clicked = true; Sound.unlock(); canvas.focus(); });
+window.addEventListener('mousedown', e => {
+  updateMouse(e);
+  const code = 'Mouse' + e.button;
+  if (!Input.down[code]) Input.pressed[code] = true;
+  Input.down[code] = true;
+  if (e.button === 0) Mouse.clicked = true;       // left click also presses menu buttons
+  if (e.target === canvas) { e.preventDefault(); canvas.focus(); }
+  Sound.unlock();
+});
+window.addEventListener('mouseup', e => { Input.down['Mouse' + e.button] = false; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());   // right click is a game button
 
 
 /* =======================================================================
@@ -275,6 +404,35 @@ const Sound = {
     src.start(t, Math.random() * 0.8); src.stop(t + dur + 0.05);
   },
 
+  // A rising tone while a fighter charges an attack. It is stored on the
+  // fighter so it can be stopped on release (or when they get hit).
+  startCharge(f) {
+    this.stopCharge(f);
+    if (!this.ctx || this.muted) return;
+    const c = this.ctx, t = c.currentTime, dur = TUNING.chargeMaxMs / 1000;
+    const osc = c.createOscillator(), g = c.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(160, t);
+    osc.frequency.linearRampToValueAtTime(760, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.06, t + 0.05);
+    osc.connect(g); g.connect(this.master);
+    osc.start(t); osc.stop(t + dur + 0.3);           // safety net: it can never ring forever
+    f.chargeSound = { osc, g };
+  },
+  stopCharge(f) {
+    const s = f.chargeSound;
+    if (!s) return;
+    f.chargeSound = null;
+    try {
+      const t = this.ctx.currentTime;
+      s.g.gain.cancelScheduledValues(t);
+      s.g.gain.setValueAtTime(Math.max(0.0001, s.g.gain.value), t);
+      s.g.gain.linearRampToValueAtTime(0, t + 0.05);
+      s.osc.stop(t + 0.06);
+    } catch (err) { /* already stopped */ }
+  },
+
   // All the game's sounds, by name.
   play(name, strength = 1) {
     if (!this.ctx || this.muted) return;
@@ -318,6 +476,8 @@ const Sound = {
       case 'counter':    this.tone(600, 0.25, { type: 'triangle', vol: 0.15, slide: 1400 }); break;
       case 'pop':        this.tone(900, 0.1, { vol: 0.15, slide: 300 }); break;
       case 'pause':      this.tone(700, 0.08, { type: 'square', vol: 0.08 }); break;
+      case 'chargeFull': this.tone(1100, 0.25, { type: 'square', vol: 0.08, slide: 2200 });
+                         this.noise(0.2, { vol: 0.15, freq: 5000, type: 'highpass' }); break;
       case 'victory':    [523, 659, 784, 1046].forEach((f, i) =>
                            this.tone(f, 0.35, { type: 'square', vol: 0.08, delay: i * 0.12 })); break;
     }
@@ -332,17 +492,18 @@ const Sound = {
    ======================================================================= */
 
 const particles = [];
-const MAX_PARTICLES = 1400;
+const particlePool = [];        // dead particles wait here to be reused (no garbage = no stutter)
+const MAX_PARTICLES = 1400;     // hard cap so the game stays at 60 FPS
 
 function spawnParticle(o) {
   if (particles.length >= MAX_PARTICLES) return;   // stay fast: never too many
+  const p = particlePool.pop() || {};              // recycle an old particle if we have one
   const life = o.life || 30;
-  particles.push({
-    x: o.x, y: o.y, vx: o.vx || 0, vy: o.vy || 0, life, maxLife: life,
-    size: o.size || 4, color: o.color || '#fff', shape: o.shape || 'circle',
-    gravity: o.gravity || 0, drag: o.drag === undefined ? 0.96 : o.drag,
-    glow: !!o.glow, grow: o.grow || 0, rot: Math.random() * 6.28, vr: o.vr || rand(-0.2, 0.2),
-  });
+  p.x = o.x; p.y = o.y; p.vx = o.vx || 0; p.vy = o.vy || 0; p.life = life; p.maxLife = life;
+  p.size = o.size || 4; p.color = o.color || '#fff'; p.shape = o.shape || 'circle';
+  p.gravity = o.gravity || 0; p.drag = o.drag === undefined ? 0.96 : o.drag;
+  p.glow = !!o.glow; p.grow = o.grow || 0; p.rot = Math.random() * 6.28; p.vr = o.vr || rand(-0.2, 0.2);
+  particles.push(p);
 }
 
 function updateParticles() {
@@ -354,9 +515,15 @@ function updateParticles() {
     p.x += p.vx; p.y += p.vy;
     p.rot += p.vr;
     p.life--;
-    if (p.life > 0) particles[alive++] = p;     // keep living particles, drop dead ones
+    if (p.life > 0) particles[alive++] = p;     // keep living particles...
+    else particlePool.push(p);                  // ...and put dead ones back in the pool
   }
   particles.length = alive;
+}
+
+function clearParticles() {
+  for (const p of particles) particlePool.push(p);
+  particles.length = 0;
 }
 
 function drawParticles(c) {
@@ -457,7 +624,7 @@ function spawnDust(x, y, count = 6) {
 
    PHYSICS NUMBERS are in pixels per frame (60 frames = 1 second):
      walkSpeed, airSpeed    top speed on the ground / in the air
-     groundAccel, airAccel  how quickly that top speed is reached
+     (acceleration and friction are shared: see TUNING at the top)
      gravity, maxFall       falling acceleration and falling speed limit
      fastFall               falling speed after tapping down
      jumpPower              upward speed of a jump (double jump separate)
@@ -483,7 +650,11 @@ function spawnDust(x, y, count = 6) {
      landingLag (aerials) frames stuck after landing mid-attack
      helpless  (recoveries) after the move you can only drift until you land
    Required moves: jab1-3, ftilt, utilt, dtilt, nair, fair, bair, uair,
-   dair, nspecial, sspecial, uspecial (a recovery!), dspecial.
+   dair, nspecial, sspecial, uspecial (a recovery!), dspecial,
+   and three CHARGED attacks (hold attack): chargeSide, chargeUp, chargeDown.
+   A charged attack's damage and knockback are multiplied by 1x-2x
+   depending on how long it was charged (see TUNING.chargeMaxMult).
+     trail  true = leave afterimages while doing the move
    ======================================================================= */
 
 // Little helpers that move scripts use. "me" is the fighter doing the move.
@@ -507,7 +678,7 @@ const FIGHTERS = {
     desc: 'A hot-headed brawler with blazing fists. Hits hard and leaves the floor burning.',
     stats: { speed: 6, power: 9, weight: 4, jump: 6 },          // shown as bars (out of 10)
     width: 44, height: 88,
-    walkSpeed: 5.3, groundAccel: 0.9, airSpeed: 4.3, airAccel: 0.38,
+    walkSpeed: 5.3, airSpeed: 4.3,
     gravity: 0.62, maxFall: 10, fastFall: 15,
     jumpPower: 13.8, doubleJumpPower: 12.8, airJumps: 1, weight: 90,
     feature: 'flame',
@@ -536,6 +707,33 @@ const FIGHTERS = {
         hitboxes: [{ x: 4, y: -100, w: 72, h: 46, dmg: 9, bkb: 5, kbs: 0.24, angle: 85 }] },
       dair: { name: 'Meteor Stomp', pose: 'stomp', startup: 12, active: 4, endlag: 20, landingLag: 18,
         hitboxes: [{ x: 0, y: -6, w: 50, h: 38, dmg: 13, bkb: 4, kbs: 0.2, angle: -80 }] },
+
+      // Charged attacks (hold attack, then release).
+      chargeSide: { name: 'Inferno Fist', pose: 'punch', startup: 4, active: 4, endlag: 22, sfx: 'fire',
+        hitboxes: [{ x: 52, y: -54, w: 84, h: 58, dmg: 11, bkb: 5, kbs: 0.19, angle: 38 }],
+        onFrame(me, f) {
+          if (f === 2) me.vx = me.facing * 7;                       // lunge into the punch
+          if (f === 5) {                                            // the fist explodes
+            fx(me, 40, 8, 56, -54);
+            me.match.addEffect({ type: 'ring', x: me.x + me.facing * 56, y: me.y - 54, r0: 10, r1: 90, life: 16, color: me.palette.glow });
+            me.match.shake(6);
+          }
+        } },
+      chargeUp: { name: 'Fire Pillar', pose: 'castUp', startup: 6, active: 8, endlag: 22, sfx: 'fire',
+        hitboxes: [{ x: 0, y: -140, w: 74, h: 210, dmg: 10, bkb: 5, kbs: 0.19, angle: 88 }],
+        onFrame(me, f) {
+          if (f === 7) me.match.addEffect({ type: 'geyser', x: me.x, y: me.y, h: 300, life: 26, color: me.palette.glow, color2: me.palette.light });
+          if (f > 6 && f < 16) fx(me, 6, 5, rand(-20, 20), -rand(20, 220), { vy: -3 });
+        } },
+      chargeDown: { name: 'Ring of Fire', pose: 'castDown', startup: 5, active: 6, endlag: 24, sfx: 'fire',
+        hitboxes: [{ x: 66, y: -22, w: 88, h: 46, dmg: 10, bkb: 5, kbs: 0.18, angle: 35, radial: true },
+                   { x: -66, y: -22, w: 88, h: 46, dmg: 10, bkb: 5, kbs: 0.18, angle: 35, radial: true }],
+        onFrame(me, f) {
+          if (f === 6) {
+            fx(me, 25, 7, 60, -14); fx(me, 25, 7, -60, -14);
+            me.match.addEffect({ type: 'ring', x: me.x, y: me.y - 18, r0: 20, r1: 130, life: 18, color: me.palette.glow, flat: true });
+          }
+        } },
 
       // Neutral special: a fireball that flies forward in a wavy line.
       nspecial: { name: 'Fireball', pose: 'cast', startup: 13, active: 1, endlag: 20, sfx: 'fire',
@@ -607,7 +805,7 @@ const FIGHTERS = {
     desc: 'A calm, flowing fighter with floaty jumps, tricky bubbles and the strongest recovery.',
     stats: { speed: 5, power: 5, weight: 5, jump: 9 },
     width: 44, height: 90,
-    walkSpeed: 4.8, groundAccel: 0.7, airSpeed: 4.5, airAccel: 0.42,
+    walkSpeed: 4.8, airSpeed: 4.5,
     gravity: 0.45, maxFall: 7.5, fastFall: 12,
     jumpPower: 12.8, doubleJumpPower: 12.8, airJumps: 1, weight: 98,
     feature: 'wave',
@@ -636,6 +834,27 @@ const FIGHTERS = {
         hitboxes: [{ x: 0, y: -104, w: 76, h: 48, dmg: 8, bkb: 5, kbs: 0.21, angle: 88 }] },
       dair: { name: 'Anchor Drop', pose: 'stomp', startup: 10, active: 6, endlag: 18, landingLag: 16,
         hitboxes: [{ x: 0, y: -6, w: 52, h: 40, dmg: 10, bkb: 4, kbs: 0.18, angle: -75 }] },
+
+      // Charged attacks
+      chargeSide: { name: 'Tidal Wave', pose: 'cast', startup: 6, active: 10, endlag: 22, sfx: 'water',
+        hitboxes: [{ x: 74, y: -44, w: 124, h: 92, dmg: 9, bkb: 6, kbs: 0.18, angle: 30 }],
+        onFrame(me, f) { if (f > 6 && f <= 16) { me.vx = me.facing * 3; fx(me, 5, 4, 80, -30, { vy: -2 }); } },
+        drawBehind(c, me) { drawWaveCrest(c, me, 1.6, 40); } },
+      chargeUp: { name: 'Water Spout', pose: 'castUp', startup: 5, active: 9, endlag: 20, sfx: 'water',
+        hitboxes: [{ x: 10, y: -125, w: 92, h: 150, dmg: 9, bkb: 6, kbs: 0.18, angle: 88 }],
+        onFrame(me, f) {
+          if (f === 6) me.match.addEffect({ type: 'geyser', x: me.x + me.facing * 10, y: me.y, h: 230, life: 24, color: me.palette.glow, color2: me.palette.light });
+          if (f > 5 && f < 14) fx(me, 5, 5, 10, -rand(30, 180), { vy: -2 });
+        } },
+      chargeDown: { name: 'Splash Burst', pose: 'castDown', startup: 5, active: 5, endlag: 22, sfx: 'water',
+        hitboxes: [{ x: 68, y: -24, w: 96, h: 52, dmg: 9, bkb: 5.5, kbs: 0.18, angle: 40, radial: true },
+                   { x: -68, y: -24, w: 96, h: 52, dmg: 9, bkb: 5.5, kbs: 0.18, angle: 40, radial: true }],
+        onFrame(me, f) {
+          if (f === 6) {
+            fx(me, 30, 7, 64, -10, { vy: -3 }); fx(me, 30, 7, -64, -10, { vy: -3 });
+            me.match.addEffect({ type: 'ring', x: me.x, y: me.y - 16, r0: 20, r1: 140, life: 18, color: me.palette.glow, flat: true });
+          }
+        } },
 
       // Neutral special: a slow bubble that traps the opponent for a moment.
       nspecial: { name: 'Bubble Trap', pose: 'cast', startup: 15, active: 1, endlag: 24, sfx: 'water',
@@ -710,7 +929,7 @@ const FIGHTERS = {
     desc: 'A hyperactive speedster. Each hit is light, but nobody can keep up with those crackling feet.',
     stats: { speed: 10, power: 3, weight: 2, jump: 7 },
     width: 40, height: 82,
-    walkSpeed: 7.2, groundAccel: 1.3, airSpeed: 5.3, airAccel: 0.5,
+    walkSpeed: 7.2, airSpeed: 5.3,
     gravity: 0.72, maxFall: 11, fastFall: 16.5,
     jumpPower: 14.8, doubleJumpPower: 13.2, airJumps: 1, weight: 72,
     feature: 'spikes',
@@ -742,6 +961,34 @@ const FIGHTERS = {
         hitboxes: [
           { x: 0, y: -8, w: 48, h: 42, dmg: 1.5, bkb: 2.5, kbs: 0, angle: -60, start: 9, end: 15, rehit: 3, group: 0 },
           { x: 0, y: -8, w: 58, h: 46, dmg: 4, bkb: 4, kbs: 0.18, angle: -80, start: 16, end: 16, group: 1 }] },
+
+      // Charged attacks
+      chargeSide: { name: 'Lightning Lunge', pose: 'dash', startup: 3, active: 8, endlag: 18, sfx: 'thunder', trail: true,
+        hitboxes: [{ x: 22, y: -42, w: 74, h: 74, dmg: 7, bkb: 5, kbs: 0.22, angle: 40 }],
+        onFrame(me, f) {
+          if (f > 3 && f <= 11) {
+            me.vx = me.facing * 16;
+            fx(me, 4, 4, 0, -40);
+            me.match.addEffect({ type: 'zap', x1: me.x - me.facing * 40, y1: me.y - 40, x2: me.x + me.facing * 20, y2: me.y - 40,
+              life: 8, color: me.palette.glow, color2: me.palette.light });
+          } else if (f > 11) me.vx *= 0.7;
+        } },
+      chargeUp: { name: 'Thunderclap', pose: 'armArc', startup: 4, active: 5, endlag: 16, sfx: 'thunder',
+        hitboxes: [{ x: 0, y: -104, w: 124, h: 72, dmg: 7, bkb: 5, kbs: 0.24, angle: 90 }],
+        onFrame(me, f) {
+          if (f === 5) {
+            me.match.addEffect({ type: 'ring', x: me.x, y: me.y - 104, r0: 10, r1: 100, life: 14, color: me.palette.light });
+            fx(me, 30, 8, 0, -104);
+            me.match.flash = Math.max(me.match.flash, 0.2);
+            me.match.shake(5);
+          }
+        } },
+      chargeDown: { name: 'Static Ring', pose: 'castDown', startup: 4, active: 6, endlag: 18, sfx: 'thunder',
+        hitboxes: [{ x: 0, y: -28, w: 176, h: 62, dmg: 7, bkb: 5, kbs: 0.22, angle: 45, radial: true }],
+        onFrame(me, f) {
+          if (f === 5) me.match.addEffect({ type: 'ring', x: me.x, y: me.y - 20, r0: 20, r1: 120, life: 16, color: me.palette.glow, flat: true });
+          if (f > 4 && f <= 10) fx(me, 6, 6, rand(-80, 80), -20);
+        } },
 
       // Neutral special: hold the button to charge a bigger lightning bolt.
       nspecial: { name: 'Charge Bolt', pose: 'cast', startup: 6, active: 1, endlag: 16, sfx: 'thunder',
@@ -822,7 +1069,7 @@ const FIGHTERS = {
     desc: 'A radiant guardian with long reach. Lasers, mirrors and blinding flashes keep foes at bay.',
     stats: { speed: 5, power: 6, weight: 5, jump: 6 },
     width: 44, height: 94,
-    walkSpeed: 5.0, groundAccel: 0.8, airSpeed: 4.3, airAccel: 0.36,
+    walkSpeed: 5.0, airSpeed: 4.3,
     gravity: 0.58, maxFall: 9.5, fastFall: 14,
     jumpPower: 13.6, doubleJumpPower: 12.6, airJumps: 1, weight: 100,
     feature: 'halo',
@@ -851,6 +1098,32 @@ const FIGHTERS = {
         hitboxes: [{ x: 0, y: -112, w: 92, h: 52, dmg: 9, bkb: 5, kbs: 0.23, angle: 86 }] },
       dair: { name: 'Solar Drop', pose: 'stomp', startup: 12, active: 4, endlag: 20, landingLag: 16,
         hitboxes: [{ x: 0, y: -4, w: 56, h: 42, dmg: 12, bkb: 4, kbs: 0.2, angle: -80 }] },
+
+      // Charged attacks
+      chargeSide: { name: 'Radiant Lance', pose: 'punch', startup: 6, active: 5, endlag: 22, sfx: 'light',
+        hitboxes: [{ x: 110, y: -58, w: 180, h: 32, dmg: 10, bkb: 5.5, kbs: 0.19, angle: 30 }],
+        onFrame(me, f) {
+          if (f === 7) me.match.addEffect({ type: 'beam', owner: me, len: 200, oy: -58, life: 10, color: me.palette.glow, color2: me.palette.light });
+        } },
+      chargeUp: { name: 'Sunburst', pose: 'castUp', startup: 6, active: 6, endlag: 22, sfx: 'light',
+        hitboxes: [{ x: 0, y: -125, w: 146, h: 104, dmg: 9, bkb: 5.5, kbs: 0.2, angle: 86, radial: true }],
+        onFrame(me, f) {
+          if (f === 7) {
+            fx(me, 40, 8, 0, -125);
+            me.match.addEffect({ type: 'ring', x: me.x, y: me.y - 125, r0: 10, r1: 110, life: 18, color: me.palette.glow });
+            me.match.flash = Math.max(me.match.flash, 0.25);
+          }
+        } },
+      chargeDown: { name: 'Halo Slam', pose: 'castDown', startup: 6, active: 5, endlag: 24, sfx: 'light',
+        hitboxes: [{ x: 74, y: -18, w: 104, h: 42, dmg: 9, bkb: 5.5, kbs: 0.19, angle: 30, radial: true },
+                   { x: -74, y: -18, w: 104, h: 42, dmg: 9, bkb: 5.5, kbs: 0.19, angle: 30, radial: true }],
+        onFrame(me, f) {
+          if (f === 7) {
+            fx(me, 40, 7, 0, -10);
+            me.match.addEffect({ type: 'ring', x: me.x, y: me.y - 10, r0: 30, r1: 150, life: 20, color: me.palette.glow, flat: true });
+            me.match.shake(5);
+          }
+        } },
 
       // Neutral special: a long laser beam across the stage.
       nspecial: { name: 'Light Beam', pose: 'cast', startup: 18, active: 6, endlag: 22, sfx: 'light',
@@ -927,7 +1200,7 @@ const FIGHTERS = {
     desc: 'A towering shadow knight. Slow and heavy, but every blow can send you into the void.',
     stats: { speed: 2, power: 10, weight: 10, jump: 4 },
     width: 52, height: 102,
-    walkSpeed: 3.9, groundAccel: 0.55, airSpeed: 3.6, airAccel: 0.3,
+    walkSpeed: 3.9, airSpeed: 3.6,
     gravity: 0.7, maxFall: 11.5, fastFall: 16,
     jumpPower: 14.4, doubleJumpPower: 12.4, airJumps: 1, weight: 125,
     feature: 'horns',
@@ -956,6 +1229,33 @@ const FIGHTERS = {
         hitboxes: [{ x: 0, y: -118, w: 86, h: 52, dmg: 13, bkb: 5.5, kbs: 0.21, angle: 88 }] },
       dair: { name: 'Abyss Stomp', pose: 'stomp', startup: 16, active: 5, endlag: 24, landingLag: 22,
         hitboxes: [{ x: 0, y: -4, w: 62, h: 46, dmg: 17, bkb: 4.5, kbs: 0.19, angle: -80 }] },
+
+      // Charged attacks
+      chargeSide: { name: 'Void Fist', pose: 'punch', startup: 8, active: 5, endlag: 26, sfx: 'dark',
+        hitboxes: [{ x: 62, y: -60, w: 94, h: 62, dmg: 13, bkb: 5.5, kbs: 0.18, angle: 35 }],
+        onFrame(me, f) {
+          if (f === 3) me.vx = me.facing * 6;
+          if (f === 9) {
+            fx(me, 40, 7, 70, -60);
+            me.match.addEffect({ type: 'ring', x: me.x + me.facing * 70, y: me.y - 60, r0: 80, r1: 10, life: 16, color: me.palette.glow });
+            me.match.shake(8);
+          }
+        } },
+      chargeUp: { name: 'Shadow Eruption', pose: 'castUp', startup: 8, active: 8, endlag: 26, sfx: 'dark',
+        hitboxes: [{ x: 0, y: -135, w: 116, h: 170, dmg: 12, bkb: 5.5, kbs: 0.18, angle: 88 }],
+        onFrame(me, f) {
+          if (f === 9) me.match.addEffect({ type: 'geyser', x: me.x, y: me.y, h: 260, life: 28, color: me.palette.glow, color2: me.palette.fx[3] });
+          if (f > 8 && f < 18) fx(me, 6, 4, rand(-30, 30), -rand(20, 220), { vy: -2 });
+        } },
+      chargeDown: { name: 'Darkness Crater', pose: 'castDown', startup: 8, active: 6, endlag: 28, sfx: 'dark',
+        hitboxes: [{ x: 0, y: -26, w: 244, h: 64, dmg: 12, bkb: 5.5, kbs: 0.18, angle: 40, radial: true }],
+        onFrame(me, f) {
+          if (f === 9) {
+            fx(me, 60, 8, 0, -10);
+            me.match.addEffect({ type: 'ring', x: me.x, y: me.y - 8, r0: 20, r1: 160, life: 22, color: me.palette.glow, flat: true });
+            me.match.shake(10);
+          }
+        } },
 
       // Neutral special: a slow orb of shadow that follows the opponent.
       nspecial: { name: 'Shadow Orb', pose: 'cast', startup: 18, active: 1, endlag: 24, sfx: 'dark',
@@ -1045,7 +1345,7 @@ const FIGHTER_ORDER = ['pyro', 'tide', 'volt', 'lumen', 'umbra'];
 
 // Fill in defaults so every move is complete (runs once at start-up).
 const REQUIRED_MOVES = ['jab1', 'jab2', 'jab3', 'ftilt', 'utilt', 'dtilt', 'nair', 'fair', 'bair', 'uair', 'dair',
-  'nspecial', 'sspecial', 'uspecial', 'dspecial'];
+  'nspecial', 'sspecial', 'uspecial', 'dspecial', 'chargeSide', 'chargeUp', 'chargeDown'];
 const AERIALS = ['nair', 'fair', 'bair', 'uair', 'dair'];
 for (const id in FIGHTERS) {
   const def = FIGHTERS[id];
@@ -1057,6 +1357,8 @@ for (const id in FIGHTERS) {
     m.hitboxes = m.hitboxes || [];
     m.duration = m.duration || (m.startup + m.active + m.endlag);
     m.aerial = AERIALS.includes(name);
+    m.charge = name.startsWith('charge');            // damage/knockback get the charge multiplier
+    m.swipe = m.charge || /^(jab|ftilt|utilt|dtilt|nair|fair|bair|uair|dair)/.test(name);   // draw a swipe arc
     if (name === 'uspecial') m.canGrabLedge = true;   // recoveries can snap to the ledge
     for (const hb of m.hitboxes) {
       if (hb.start === undefined) hb.start = m.startup + 1;
@@ -1149,6 +1451,20 @@ const STAGES = [
           og.addColorStop(0, '#ffffff'); og.addColorStop(0.25, orbColors[i]); og.addColorStop(1, rgba(orbColors[i], 0));
           c.fillStyle = og; c.beginPath(); c.arc(x, top - 40, pulse * 3, 0, Math.PI * 2); c.fill();
         }
+      });
+
+      withParallax(c, cam, 0.6, () => {                // glowing spirit lights drifting upward
+        c.save(); c.globalCompositeOperation = 'lighter';
+        const cols = ['#ff7b00', '#3fd8ff', '#ffd60a', '#fff2b0', '#b44dff'];
+        for (let i = 0; i < 26; i++) {
+          const x = (i * 173.7) % 1800 - 260 + Math.sin(t * 0.01 + i) * 40;
+          const y = 900 - ((t * (0.25 + (i % 4) * 0.1) + i * 97) % 1200);
+          const r = 3 + (i % 3) * 2;
+          const g = c.createRadialGradient(x, y, 0, x, y, r * 4);
+          g.addColorStop(0, rgba(cols[i % 5], 0.7)); g.addColorStop(1, rgba(cols[i % 5], 0));
+          c.fillStyle = g; c.fillRect(x - r * 4, y - r * 4, r * 8, r * 8);
+        }
+        c.restore();
       });
 
       withParallax(c, cam, 0.7, () => {                // soft drifting clouds
@@ -1294,11 +1610,21 @@ function blendPose(a, b, t) {
 // Poses for normal states. Many are functions of time (t) so they animate.
 const POSES = {
   idle: t => mkPose({ lean: 0.06, crouch: 0.06 + Math.sin(t * 0.08) * 0.03, aF: 0.35, eF: 0.9, aB: -0.15, eB: 0.9, lF: 0.18, kF: 0.2, lB: -0.14, kB: 0.15 }),
-  walk: (t, s) => {
-    const c = Math.sin(t * 0.32);
-    return mkPose({ lean: 0.15 * s + 0.04, crouch: 0.05, aF: -c * 0.7 * s + 0.2, eF: 0.6, aB: c * 0.7 * s - 0.1, eB: 0.6,
-      lF: c * 0.65 * s, kF: 0.25 + Math.max(0, -c) * 0.6 * s, lB: -c * 0.65 * s, kB: 0.25 + Math.max(0, c) * 0.6 * s });
+  // A full run cycle. ph = phase (advances faster at higher speed), s = 0..1 speed.
+  // Legs swing opposite to each other, the knee of the leg swinging back folds
+  // up, arms pump against the legs, and the body bobs twice per cycle.
+  run: (ph, s) => {
+    const c = Math.sin(ph), c2 = Math.cos(ph);
+    return mkPose({
+      lean: 0.12 + 0.25 * s, crouch: 0.1 + 0.06 * s, yOff: -Math.abs(c) * 6 * s,
+      lF: c * 1.0 * s, kF: 0.25 + Math.max(0, c2) * 1.5 * s,
+      lB: -c * 1.0 * s, kB: 0.25 + Math.max(0, -c2) * 1.5 * s,
+      aF: -c * 1.1 * s + 0.25, eF: 1.4, aB: c * 1.1 * s - 0.05, eB: 1.4,
+    });
   },
+  rise: () => mkPose({ lean: -0.05, aF: 2.5, eF: 0.25, aB: 2.1, eB: 0.35, lF: 0.15, kF: 0.25, lB: -0.15, kB: 0.35 }),   // stretched upward
+  tuck: () => mkPose({ lean: 0.15, aF: 1.3, eF: 1.3, aB: 1.0, eB: 1.3, lF: 1.3, kF: 2.1, lB: 0.9, kB: 1.9 }),            // knees up at the peak
+  fastfall: () => mkPose({ aF: 3.0, eF: 0, aB: 2.9, eB: 0, lF: 0.05, kF: 0, lB: -0.05, kB: 0 }),                        // dive straight down
   crouch: () => mkPose({ lean: 0.35, crouch: 0.75, aF: 0.6, eF: 1.1, aB: 0.3, eB: 1.0, lF: 0.9, kF: 1.7, lB: 0.3, kB: 1.4 }),
   jump: () => mkPose({ aF: 2.0, eF: 0.4, aB: -0.8, eB: 0.5, lF: 0.8, kF: 1.6, lB: 0.2, kB: 1.2 }),
   fall: t => mkPose({ aF: 2.1 + Math.sin(t * 0.2) * 0.1, eF: 0.3, aB: 1.7, eB: 0.3, lF: 0.3, kF: 0.4, lB: -0.2, kB: 0.5 }),
@@ -1336,20 +1662,30 @@ const ATTACK_POSES = {
   glide:    { wind: {}, hit: { aF: 1.7, eF: 0.1, aB: 1.3, eB: 0.1, lean: 0.9, lF: -0.3, kF: 0.4, lB: -0.6, kB: 0.6 } },
 };
 
-// Works out a fighter's pose during an attack:
-// blend from base -> wind-up during startup, snap to the strike while the
-// hitbox is out, then ease back to the base pose during endlag.
+// Works out a fighter's pose during an attack in three beats:
+//   anticipation: ease into the wind-up during startup
+//   strike:       whip to the hit pose in 2 frames, overshooting a little
+//   follow-through: drift slowly back to the base pose during endlag
 function standardAttackPose(m, poseName, f, base) {
   const def = ATTACK_POSES[poseName] || ATTACK_POSES.punch;
   const wind = Object.assign({}, base, def.wind), hit = Object.assign({}, base, def.hit);
   const activeEnd = m.startup + m.active;
-  if (f <= m.startup) return blendPose(base, wind, f / Math.max(1, m.startup));
+  if (f <= m.startup) return blendPose(base, wind, easeOutCubic(f / Math.max(1, m.startup)));
   if (f <= activeEnd) {
-    const pose = blendPose(wind, hit, Math.min(1, (f - m.startup) / 2));
-    if (def.spin) pose.rot = def.spin * Math.PI * 2 * ((f - m.startup) / Math.max(1, m.active));
+    const pose = blendPose(wind, hit, easeOutBack(Math.min(1, (f - m.startup) / 2)));
+    if (def.spin) pose.rot = def.spin * Math.PI * 2 * easeOutCubic((f - m.startup) / Math.max(1, m.active));
     return pose;
   }
-  return blendPose(hit, base, Math.min(1, (f - activeEnd) / Math.max(1, Math.min(m.endlag, 14))));
+  return blendPose(hit, base, easeInOutSine(Math.min(1, (f - activeEnd) / Math.max(1, Math.min(m.endlag, 16)))));
+}
+
+// Moves the drawn pose a fraction of the way toward the target pose each
+// frame, so changing state never snaps. (Rotation is copied directly so
+// flips don't spin backwards.)
+function smoothPose(cur, target, rate) {
+  const out = {};
+  for (const k of POSE_KEYS) out[k] = k === 'rot' ? target.rot : lerp(cur[k], target[k], rate);
+  return out;
 }
 
 // Draw one two-part limb (upper + lower) from (sx, sy). Returns the hand/foot position.
@@ -1383,7 +1719,21 @@ const FEATURES = {
       }
     },
   },
-  wave: {    // a curling crest of water sweeping back over the head
+  wave: {    // a flowing water cape behind, a curling crest of water over the head
+    back(c, b) {
+      const { sh, hip, H: Hh, pal, t } = b;
+      const w1 = Math.sin(t * 0.15) * Hh * 0.06, w2 = Math.sin(t * 0.15 + 1.5) * Hh * 0.06;
+      c.beginPath();
+      c.moveTo(sh.x, sh.y);
+      c.quadraticCurveTo(sh.x - Hh * 0.3, sh.y + Hh * 0.15 + w1, hip.x - Hh * 0.42 + w2, hip.y + Hh * 0.3);
+      c.quadraticCurveTo(hip.x - Hh * 0.28, hip.y + Hh * 0.2 + w1, hip.x - Hh * 0.16 + w1, hip.y + Hh * 0.34);
+      c.quadraticCurveTo(hip.x - Hh * 0.05, hip.y, sh.x - Hh * 0.04, sh.y + Hh * 0.05);
+      c.closePath();
+      const g = c.createLinearGradient(0, sh.y, 0, hip.y + Hh * 0.3);
+      g.addColorStop(0, rgba(pal.glow, 0.75)); g.addColorStop(1, rgba(pal.light, 0.15));
+      c.fillStyle = g; c.fill();
+      c.strokeStyle = rgba(pal.light, 0.6); c.lineWidth = 1.5; c.stroke();
+    },
     front(c, b) {
       const { head, headR: R, pal, t } = b;
       const s = Math.sin(t * 0.1) * R * 0.08;
@@ -1462,6 +1812,18 @@ const FEATURES = {
       };
       horn(head.x - R * 0.45, 1, 0.9);
       horn(head.x + R * 0.45, 1, 1.05);
+      // shadow wisps curling up from the shoulders
+      const { sh, H: Hh, t } = b;
+      c.save();
+      c.strokeStyle = rgba(pal.glow, 0.55); c.lineWidth = 3; c.lineCap = 'round';
+      for (let i = 0; i < 3; i++) {
+        const ph = t * 0.08 + i * 2.1, bx = sh.x - Hh * 0.12 + i * Hh * 0.1;
+        c.beginPath(); c.moveTo(bx, sh.y);
+        c.bezierCurveTo(bx + Math.sin(ph) * 10, sh.y - Hh * 0.12, bx - Math.sin(ph + 1) * 12, sh.y - Hh * 0.22,
+          bx + Math.sin(ph + 2) * 8, sh.y - Hh * 0.3 - (i % 2) * 6);
+        c.stroke();
+      }
+      c.restore();
     },
   },
 };
@@ -1487,13 +1849,16 @@ function drawWings(c, sh, Hh, pal, t) {
 }
 
 // The main fighter drawing function. Draws at feet position (x, y).
-// opt: scale, alpha, time, wings, charge (0..60), glow (strike glow on hand/foot)
+// opt: scale, alpha, time, wings, charge (0..60), glow (strike glow on hand/foot),
+//      sx/sy (squash & stretch), ghost (cheap version for afterimages)
 function drawFighter(c, def, pal, x, y, facing, p, opt = {}) {
   const Hh = def.height;
   const t = opt.time || 0;
   c.save();
   c.translate(x, y);
-  c.scale((opt.scale || 1) * facing, opt.scale || 1);   // mirror when facing left
+  // facing mirrors the drawing (and shrinks toward 0 mid-turn for a quick flip);
+  // sx/sy squash and stretch the whole body from the feet
+  c.scale((opt.scale || 1) * facing * (opt.sx || 1), (opt.scale || 1) * (opt.sy || 1));
   if (opt.alpha !== undefined) c.globalAlpha = opt.alpha;
 
   // skeleton positions (local coordinates, feet at 0,0, forward = +x)
@@ -1511,6 +1876,7 @@ function drawFighter(c, def, pal, x, y, facing, p, opt = {}) {
 
   // 1. glowing elemental aura
   const chest = { x: (sh.x + hip.x) / 2, y: (sh.y + hip.y) / 2 };
+  if (!opt.ghost) {
   c.save();
   c.globalCompositeOperation = 'lighter';
   const pulse = 0.22 + Math.sin(t * 0.1) * 0.07 + (opt.auraBoost || 0);
@@ -1518,6 +1884,7 @@ function drawFighter(c, def, pal, x, y, facing, p, opt = {}) {
   ag.addColorStop(0, rgba(pal.glow, pulse)); ag.addColorStop(1, rgba(pal.glow, 0));
   c.fillStyle = ag; c.beginPath(); c.arc(chest.x, chest.y, Hh * 0.8, 0, Math.PI * 2); c.fill();
   c.restore();
+  }
 
   // 2. things behind the body
   if (opt.wings) drawWings(c, sh, Hh, pal, t);
@@ -1551,7 +1918,7 @@ function drawFighter(c, def, pal, x, y, facing, p, opt = {}) {
   c.fillStyle = hg; c.strokeStyle = pal.dark; c.lineWidth = 3;
   c.beginPath(); c.arc(head.x, head.y, headR, 0, Math.PI * 2); c.fill(); c.stroke();
   c.fillStyle = pal.eye;
-  c.shadowColor = pal.eye; c.shadowBlur = 8;
+  c.shadowColor = pal.eye; c.shadowBlur = opt.ghost ? 0 : 8;
   c.beginPath(); c.ellipse(head.x + headR * 0.5, head.y - headR * 0.05, headR * 0.13, headR * 0.27, 0, 0, Math.PI * 2); c.fill();
   c.beginPath(); c.ellipse(head.x + headR * 0.08, head.y - headR * 0.05, headR * 0.11, headR * 0.24, 0, 0, Math.PI * 2); c.fill();
   c.shadowBlur = 0;
@@ -1570,8 +1937,8 @@ function drawFighter(c, def, pal, x, y, facing, p, opt = {}) {
     gg.addColorStop(0, '#ffffff'); gg.addColorStop(0.35, pal.glow); gg.addColorStop(1, rgba(pal.glow, 0));
     c.fillStyle = gg; c.beginPath(); c.arc(gx, gy, r, 0, Math.PI * 2); c.fill();
   };
-  if (opt.charge) glowAt(hand.x, hand.y, 8 + opt.charge * 0.45 + Math.sin(t * 0.8) * 2);
-  if (opt.glow) { glowAt(hand.x, hand.y, Hh * 0.2); glowAt(foot.x, foot.y, Hh * 0.16); }
+  if (opt.charge && !opt.ghost) glowAt(hand.x, hand.y, 8 + opt.charge * 0.45 + Math.sin(t * 0.8) * 2);
+  if (opt.glow && !opt.ghost) { glowAt(hand.x, hand.y, Hh * 0.2); glowAt(foot.x, foot.y, Hh * 0.16); }
   c.restore();
 
   c.restore();
@@ -1608,11 +1975,13 @@ function drawTendril(c, x1, y1, x2, y2, pal, t) {
   c.restore();
 }
 
-// Tide's surfing wave.
-function drawWaveCrest(c, me) {
+// Tide's surfing wave (s = size, ox = how far in front of Tide).
+function drawWaveCrest(c, me, s = 1, ox = 0) {
   const f = me.moveFrame;
   if (f < 8 || f > 38) return;
-  const d = me.facing, x = me.x, y = me.y;
+  const d = me.facing, x = me.x + me.facing * ox, y = me.y;
+  c.save();
+  c.translate(x, y); c.scale(s, s); c.translate(-x, -y);
   const g = c.createLinearGradient(x, y - 80, x, y);
   g.addColorStop(0, rgba(me.palette.light, 0.9)); g.addColorStop(1, rgba(me.palette.glow, 0.5));
   c.fillStyle = g;
@@ -1622,6 +1991,7 @@ function drawWaveCrest(c, me) {
   c.quadraticCurveTo(x + d * 90, y - 80, x + d * 80, y - 40);
   c.quadraticCurveTo(x + d * 70, y - 55, x + d * 60, y);
   c.closePath(); c.fill();
+  c.restore();
 }
 
 // The floating disc a fighter stands on after respawning.
@@ -1647,6 +2017,7 @@ function drawRespawnPlatform(c, x, y, pal, t) {
      landing              short lag after landing
      air                  airborne and free to act
      attack               doing a move (this.move)
+     charging             holding attack to power up a charged attack
      hitstun              just got hit, can't act
      shield, dodge        defending
      helpless             after an up special, can only drift
@@ -1659,11 +2030,13 @@ function drawRespawnPlatform(c, x, y, pal, t) {
 class Fighter {
   constructor(match, index, fighterId, useAltColors) {
     this.match = match;
-    this.index = index;                    // 0 = P1, 1 = P2
+    this.index = index;                    // 0 = P1, 1 = P2 (also picks the binding map)
     this.id = fighterId;
     this.def = FIGHTERS[fighterId];
     this.palette = useAltColors ? this.def.altColors : this.def.colors;
-    this.controls = CONTROLS[index];
+    // single-colour version used for afterimages
+    const pal = this.palette;
+    this.ghostPalette = { body: pal.glow, dark: pal.glow, light: pal.light, glow: pal.glow, eye: pal.light, fx: pal.fx };
     this.halfW = this.def.width / 2;
     this.stocks = START_STOCKS;
     this.percent = 0;
@@ -1682,6 +2055,8 @@ class Fighter {
     this.hitSet = new Map();               // who this move already hit
     this.airJumps = this.def.airJumps;
     this.fastFalling = false; this.usedSideSpecial = false; this.usedAirDodge = false;
+    this.coyote = 0;                       // frames left to still jump after walking off an edge
+    this.jumpCutAllowed = false;           // true while rising from a ground jump (short hop check)
     this.hitlag = 0; this.hitstun = 0; this.invuln = 0;
     this.intangible = false; this.invisible = false; this.noGravity = false;
     this.shieldHP = MAX_SHIELD; this.shieldStun = 0;
@@ -1689,13 +2064,24 @@ class Fighter {
     this.slowTimer = 0; this.slowAcc = 0; this.trapTimer = 0;
     this.grabbedBy = null; this.grabbing = null; this.counterDmg = 0;
     this.attackBuf = 0; this.specialBuf = 0; this.jumpBuf = 0; this.shieldBuf = 0;
-    this.lastHitBy = null; this.hudShake = 0; this.animTime = 0;
+    this.attackHold = 0;                   // frames the attack button has been held
+    this.chargeMove = ''; this.chargeFrames = 0; this.chargeMult = 1; this.chargeFlash = 0;
+    this.pendingDI = false;
+    this.lastHitBy = null; this.hudShake = 0; this.hudPop = 0; this.hitFlash = 0; this.animTime = 0;
     this.dodgeType = ''; this.dodgeDir = 0;
+    // animation-only values (they never change the gameplay)
+    this.visFacing = this.facing || 1;     // smoothly turns toward this.facing
+    this.squash = 0; this.squashVel = 0;   // squash & stretch spring (+ = squashed, - = stretched)
+    this.flipTimer = 0;                    // double jump flip
+    this.runPhase = 0; this.tumble = 0;
+    this.trail = [];                       // afterimages
+    this.animPose = null;                  // the pose actually drawn (eased toward the target pose)
     this.inp = NO_INPUT;
+    Sound.stopCharge(this);
   }
 
   spawnAt(x, y, facing) {
-    this.x = x; this.y = y - 1; this.facing = facing;
+    this.x = x; this.y = y - 1; this.facing = facing; this.visFacing = facing;
     this.state = 'air';
   }
 
@@ -1742,14 +2128,20 @@ class Fighter {
 
   // ---------------------------------------------------------------- UPDATE
   update() {
-    const inp = this.match.phase === 'countdown' ? NO_INPUT : readPlayerInput(this.controls);
+    // Local games read this player's binding map (CONTROLS). Online games
+    // hand the match both players' inputs for this frame (see section 12).
+    const inp = this.match.phase === 'countdown' ? NO_INPUT : this.match.inputFor(this.index);
     this.inp = inp;
     this.updateBuffers(inp);
     if (this.hudShake > 0) this.hudShake--;
+    if (this.hudPop > 0) this.hudPop--;
+    if (this.hitFlash > 0) this.hitFlash--;
+    if (this.chargeSound && this.state !== 'charging') Sound.stopCharge(this);   // lost the charge somehow
 
     if (this.state === 'out') return;
     if (this.state === 'dead') { if (--this.stateTimer <= 0) this.respawn(); return; }
-    if (this.hitlag > 0) { this.hitlag--; return; }          // frozen on impact
+    if (this.hitlag > 0) { this.hitlag--; return; }          // hitstop: frozen on impact
+    if (this.pendingDI) this.applyDI(inp);                   // the launch starts now: bend it
     if (this.slowTimer > 0) {                                 // Lumen's flash: skip half the frames
       this.slowTimer--;
       this.slowAcc += 0.5;
@@ -1762,17 +2154,20 @@ class Fighter {
     if (this.invuln > 0) this.invuln--;
     if (this.ledgeCooldown > 0) this.ledgeCooldown--;
     if (this.dropTimer > 0) this.dropTimer--;
+    if (this.coyote > 0) this.coyote--;
     if (this.state !== 'shield' && this.state !== 'shieldbreak') this.shieldHP = Math.min(MAX_SHIELD, this.shieldHP + 0.1);
 
+    let physics = true;
     switch (this.state) {
       case 'idle': case 'walk': case 'crouch': this.updateGround(inp); break;
       case 'jumpsquat': this.updateJumpsquat(inp); break;
       case 'landing':
-        this.vx = approach(this.vx, 0, 0.8);
+        this.vx = approach(this.vx, 0, this.def.walkSpeed / TUNING.groundStopFrames);
         if (--this.stateTimer <= 0) this.state = 'idle';
         break;
       case 'air': this.updateAir(inp); break;
       case 'attack': this.updateAttack(inp); break;
+      case 'charging': this.updateCharging(inp); break;
       case 'hitstun': this.updateHitstun(inp); break;
       case 'shield': this.updateShield(inp); break;
       case 'dodge': this.updateDodge(inp); break;
@@ -1785,64 +2180,84 @@ class Fighter {
         if (--this.stateTimer <= 0) this.state = this.grounded ? 'idle' : 'air';
         break;
       case 'trapped': this.updateTrapped(inp); break;
-      case 'ledge': this.updateLedge(inp); return;          // these states skip physics
-      case 'ledgeclimb': this.updateLedgeClimb(); return;
-      case 'grabbed': this.updateGrabbed(); return;
-      case 'respawn': this.updateRespawn(inp); return;
+      case 'ledge': this.updateLedge(inp); physics = false; break;     // these states skip physics
+      case 'ledgeclimb': this.updateLedgeClimb(); physics = false; break;
+      case 'grabbed': this.updateGrabbed(); physics = false; break;
+      case 'respawn': this.updateRespawn(inp); physics = false; break;
     }
     if (this.state === 'dead' || this.state === 'out') return;
-    this.physics();
-    this.checkLedgeGrab();
-    this.checkBlastZones();
-    this.emitAura();
+    if (physics) {
+      this.physics();
+      this.checkLedgeGrab();
+      this.checkBlastZones();
+      this.emitAura();
+    }
+    this.animate();
   }
 
   // Remember presses for a few frames so slightly-early inputs still work.
   updateBuffers(inp) {
-    const tick = this.hitlag > 0 ? 0 : 1;
-    this.attackBuf = inp.attackP ? BUFFER_FRAMES : Math.max(0, this.attackBuf - tick);
-    this.specialBuf = inp.specialP ? BUFFER_FRAMES : Math.max(0, this.specialBuf - tick);
-    this.shieldBuf = inp.shieldP ? BUFFER_FRAMES : Math.max(0, this.shieldBuf - tick);
-    this.jumpBuf = inp.upP ? 4 : Math.max(0, this.jumpBuf - tick);
+    const tick = this.hitlag > 0 ? 0 : 1;          // buffers don't run out during hitstop
+    const B = TUNING.inputBufferFrames;
+    // While attack is still held we don't know yet if it's a tap or a charge,
+    // so the buffered press is kept alive until the button is released.
+    if (inp.attackP) this.attackBuf = B;
+    else if (!(inp.attack && this.attackBuf > 0)) this.attackBuf = Math.max(0, this.attackBuf - tick);
+    this.attackHold = inp.attack ? this.attackHold + 1 : 0;
+    this.specialBuf = inp.specialP ? B : Math.max(0, this.specialBuf - tick);
+    this.shieldBuf = inp.shieldP ? B : Math.max(0, this.shieldBuf - tick);
+    this.jumpBuf = inp.jumpP ? TUNING.jumpBufferFrames : Math.max(0, this.jumpBuf - tick);
   }
 
   // ---------------------------------------------------------- GROUND STATES
   updateGround(inp) {
-    if (this.tryGroundAction(inp)) return;
-    const dirX = dirOf(inp);
-    if (inp.down) {                                  // crouch (and drop through thin platforms)
-      this.state = 'crouch';
-      this.crouchTimer++;
-      this.vx = approach(this.vx, 0, 1);
-      if (this.platform && !this.platform.solid && this.crouchTimer > 6) this.dropThrough();
+    // pressing down on a thin platform drops straight through it
+    if (inp.downP && this.platform && !this.platform.solid && !this.attackBuf && !this.specialBuf) {
+      this.dropThrough();
       return;
     }
-    this.crouchTimer = 0;
+    if (this.tryGroundAction(inp)) return;
+    const dirX = dirOf(inp);
+    const accel = this.def.walkSpeed / TUNING.groundAccelFrames;   // full speed in ~6 frames
+    const stop = this.def.walkSpeed / TUNING.groundStopFrames;     // stop in ~4 frames
+    if (inp.down) {                                  // crouch
+      this.state = 'crouch';
+      this.vx = approach(this.vx, 0, stop);
+      return;
+    }
     if (dirX !== 0) {
       this.facing = dirX;
-      this.vx = approach(this.vx, dirX * this.def.walkSpeed, this.def.groundAccel);
+      const turning = this.vx * dirX < 0;            // braking from the other direction is quicker
+      this.vx = approach(this.vx, dirX * this.def.walkSpeed, turning ? stop : accel);
       this.state = 'walk';
-      if (this.animTime % 14 === 0) spawnDust(this.x - dirX * 10, this.y, 1);
     } else {
-      this.vx = approach(this.vx, 0, 0.9);
-      this.state = 'idle';
+      this.vx = approach(this.vx, 0, stop);
+      this.state = Math.abs(this.vx) > 0.6 ? 'walk' : 'idle';
     }
   }
 
   // Check buttons while standing. Returns true if something started.
   tryGroundAction(inp) {
     const dirX = dirOf(inp);
-    if (this.attackBuf) { this.attackBuf = 0; if (inp.up) this.jumpBuf = 0; this.groundAttack(inp, dirX); return true; }
+    if (this.attackBuf) {
+      // Tap (released before CHARGE_HOLD_FRAMES) = normal attack; hold = charge.
+      const stillDeciding = inp.attack && this.attackHold < CHARGE_HOLD_FRAMES;
+      if (!stillDeciding) {
+        this.attackBuf = 0;
+        if (inp.attack) this.startCharge(inp); else this.groundAttack(inp, dirX);
+        return true;
+      }
+    }
     if (this.specialBuf) {
       this.specialBuf = 0;
-      if (inp.up) this.jumpBuf = 0;
       if (this.doSpecial(inp, dirX)) return true;
     }
-    if (inp.shield && this.shieldHP > 0) {
-      if (this.shieldBuf && dirX) { this.shieldBuf = 0; this.startDodge('roll', dirX); return true; }   // shield + direction = roll
-      if (this.shieldBuf && inp.down) { this.shieldBuf = 0; this.startDodge('spot', 0); return true; }  // shield + down = spot dodge
+    if ((inp.shield || this.shieldBuf) && this.shieldHP > 0) {
+      const tapped = this.shieldBuf > 0;
       this.shieldBuf = 0;
-      this.state = 'shield';
+      if (tapped && dirX) { this.startDodge('roll', dirX); return true; }          // shield + direction = roll
+      if (tapped && (inp.down || !inp.shield)) { this.startDodge('spot', 0); return true; }   // down, or a super-quick tap
+      this.state = 'shield'; this.stateTimer = 0;
       return true;
     }
     if (this.jumpBuf) { this.jumpBuf = 0; this.state = 'jumpsquat'; this.stateTimer = 0; return true; }
@@ -1881,37 +2296,40 @@ class Fighter {
     return true;
   }
 
+  // A short crouch before leaving the ground (attacks pressed now stay buffered
+  // and come out as aerials right after take-off).
   updateJumpsquat(inp) {
     this.stateTimer++;
     this.vx = approach(this.vx, 0, 0.3);
-    // Pressing attack/special right as you jump does the "up" version instead.
-    if (this.attackBuf) { this.attackBuf = 0; this.groundAttack(inp, dirOf(inp)); return; }
-    if (this.specialBuf) { this.specialBuf = 0; if (this.doSpecial(inp, dirOf(inp))) return; }
-    if (this.stateTimer >= 4) {
-      const fullHop = inp.up;                        // tap = short hop, hold = full jump
-      this.vy = -this.def.jumpPower * (fullHop ? 1 : 0.68);
-      this.vx = clamp(this.vx + dirOf(inp) * 1.5, -this.def.airSpeed, this.def.airSpeed);
-      this.grounded = false; this.platform = null;
-      this.state = 'air';
-      Sound.play('jump');
-      spawnDust(this.x, this.y, 5);
-    }
+    if (this.stateTimer >= TUNING.jumpSquatFrames) this.groundJump(inp);
+  }
+
+  // Leave the ground. Releasing jump while still rising cuts the jump short.
+  groundJump(inp) {
+    this.vy = -this.def.jumpPower;
+    this.vx = clamp(this.vx + dirOf(inp) * 1.5, -this.def.airSpeed, this.def.airSpeed);
+    this.grounded = false; this.platform = null;
+    this.state = 'air';
+    this.coyote = 0;
+    this.jumpCutAllowed = true;
+    this.squash = -0.28;                           // stretch on take-off
+    Sound.play('jump');
+    spawnDust(this.x, this.y, 5);
   }
 
   dropThrough() {
     this.grounded = false; this.platform = null;
     this.dropTimer = 14;                             // ignore thin platforms for a moment
     this.y += 2; this.vy = 1.5;
-    this.state = 'air'; this.crouchTimer = 0;
+    this.state = 'air'; this.crouchTimer = 0; this.coyote = 0;
   }
 
   // ------------------------------------------------------------- AIR STATES
   updateAir(inp) {
     const dirX = dirOf(inp);
-    if (this.attackBuf) { this.attackBuf = 0; if (inp.up) this.jumpBuf = 0; this.airAttack(inp, dirX); return; }
+    if (this.attackBuf) { this.attackBuf = 0; this.airAttack(inp, dirX); return; }   // aerials come out instantly
     if (this.specialBuf) {
       this.specialBuf = 0;
-      if (inp.up) this.jumpBuf = 0;
       if (this.doSpecial(inp, dirX)) return;
     }
     if (this.shieldBuf && !this.usedAirDodge) {
@@ -1919,34 +2337,41 @@ class Fighter {
       this.startDodge('air', dirX, inp.up ? -1 : inp.down ? 1 : 0);
       return;
     }
-    if (this.jumpBuf && this.airJumps > 0) { this.jumpBuf = 0; this.doubleJump(dirX); return; }
+    if (this.jumpBuf) {
+      if (this.coyote > 0) { this.jumpBuf = 0; this.groundJump(inp); return; }    // coyote time: still a ground jump
+      if (this.airJumps > 0) { this.jumpBuf = 0; this.doubleJump(dirX); return; }
+    }
     this.airDrift(inp, 1);
     this.checkFastFall(inp);
   }
 
   doubleJump(dirX) {
     this.airJumps--;
-    this.vy = -this.def.doubleJumpPower;
+    this.vy = -this.def.doubleJumpPower;           // always a full reset of vertical speed
     this.vx = dirX * this.def.airSpeed;
-    this.kbx *= 0.5; this.kby = Math.min(this.kby, 0) * 0.5;
-    this.fastFalling = false;
+    this.kbx *= 0.5; this.kby = 0;
+    this.fastFalling = false; this.jumpCutAllowed = false;
+    this.flipTimer = 22;                           // play the flip animation
+    this.squash = -0.22;
     Sound.play('djump');
-    fx(this, 12, 3, 0, 0, { angle: Math.PI / 2, spread: 1.2 });
-    spawnParticle({ x: this.x, y: this.y, life: 18, size: 10, grow: 30, color: this.palette.light, shape: 'ring', drag: 1 });
+    fx(this, 16, 4, 0, 0, { angle: Math.PI / 2, spread: 1.2 });     // element burst under the feet
+    spawnParticle({ x: this.x, y: this.y, life: 18, size: 10, grow: 34, color: this.palette.light, shape: 'ring', drag: 1 });
   }
 
   // Steer in the air toward the held direction.
   airDrift(inp, mult) {
-    const dirX = dirOf(inp);
-    if (dirX) this.vx = approach(this.vx, dirX * this.def.airSpeed * mult, this.def.airAccel);
-    else this.vx = approach(this.vx, 0, 0.06);
+    const dirX = dirOf(inp), max = this.def.airSpeed * mult;
+    const accel = this.def.airSpeed / TUNING.airAccelFrames;
+    if (dirX) this.vx = approach(this.vx, dirX * max, this.vx * dirX < 0 ? accel * 1.5 : accel);
+    else this.vx = approach(this.vx, 0, this.def.airSpeed / TUNING.airStopFrames);
   }
 
-  // Tap down while falling (or at the top of a jump) to fall much faster.
+  // Tap down at the peak of a jump or while falling to fall much faster.
   checkFastFall(inp) {
     if (inp.downP && !this.fastFalling && !this.grounded && this.vy > -3) {
       this.fastFalling = true;
       this.vy = this.def.fastFall;
+      this.squash = -0.18;
       spawnParticle({ x: this.x, y: this.y - this.def.height / 2, life: 10, size: 6, grow: 20, color: '#ffffff', shape: 'ring', drag: 1 });
     }
   }
@@ -1960,6 +2385,7 @@ class Fighter {
     this.hitSet.clear();
     this.state = 'attack';
     this.crouchTimer = 0;
+    this.visFacing = this.facing;         // attacks always face the right way instantly
     if (m.onStart) m.onStart(this);
   }
 
@@ -1967,8 +2393,8 @@ class Fighter {
     const m = this.move;
     this.moveFrame++;
     const f = this.moveFrame;
-    // default movement: slide to a stop on the ground, gentle steering in the air
-    if (this.grounded) this.vx = approach(this.vx, 0, 0.7);
+    // default movement: slide to a stop on the ground, steering in the air
+    if (this.grounded) this.vx = approach(this.vx, 0, this.def.walkSpeed / TUNING.groundStopFrames * 0.5);
     else if (!m.noDrift) this.airDrift(inp, 0.85);
     if (m.aerial) this.checkFastFall(inp);
 
@@ -1985,7 +2411,7 @@ class Fighter {
           this.y + hb.y + rand(-hb.h / 2, hb.h / 2) * 0.8, 1, 2);
       }
     }
-    // jab combo: press attack again to continue into the next hit
+    // jab combo: tap attack again to continue into the next hit
     if (m.next && f >= m.chainFrom && this.attackBuf && this.grounded) {
       this.attackBuf = 0;
       this.startMove(m.next);
@@ -1999,6 +2425,51 @@ class Fighter {
     this.move = null; this.moveName = '';
     if (this.grounded) this.state = 'idle';
     else this.state = m && m.helpless ? 'helpless' : 'air';
+  }
+
+  // --------------------------------------------------------- CHARGED ATTACKS
+  // The direction held when charging starts picks side / up / down.
+  startCharge(inp) {
+    const dirX = dirOf(inp);
+    let name = 'chargeSide';
+    if (inp.up) name = 'chargeUp';
+    else if (inp.down) name = 'chargeDown';
+    else if (dirX) this.facing = dirX;
+    if (!this.def.moves[name]) { this.groundAttack(inp, dirX); return; }   // fighter without charged moves
+    this.state = 'charging';
+    this.chargeMove = name; this.chargeFrames = 0; this.chargeMult = 1;
+    this.visFacing = this.facing;
+    Sound.startCharge(this);
+  }
+
+  updateCharging(inp) {
+    this.vx = approach(this.vx, 0, this.def.walkSpeed / TUNING.groundStopFrames);   // plant your feet
+    this.chargeFrames++;
+    const k = this.chargeFrames / CHARGE_MAX_FRAMES;
+    // energy particles get pulled in toward the fighter
+    if (this.animTime % 2 === 0) {
+      const a = rand(0, Math.PI * 2), r = 70 + 50 * k;
+      const cx = this.x, cy = this.y - this.def.height * 0.5;
+      spawnParticle({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r, vx: -Math.cos(a) * r / 12, vy: -Math.sin(a) * r / 12,
+        life: 12, size: 2 + 3 * k, color: this.palette.fx[Math.floor(rand(0, this.palette.fx.length))], shape: 'circle', glow: true, drag: 1 });
+    }
+    const full = this.chargeFrames >= CHARGE_MAX_FRAMES;
+    if (!inp.attack || full) this.releaseCharge(full);   // release early, or auto-release at full
+  }
+
+  releaseCharge(full) {
+    // 1.0x at the start of the charge up to chargeMaxMult (2.0x) when full
+    const mult = 1 + (TUNING.chargeMaxMult - 1) * Math.min(1, this.chargeFrames / CHARGE_MAX_FRAMES);
+    Sound.stopCharge(this);
+    if (full) {                                       // white flash at full charge
+      this.chargeFlash = 6;
+      this.match.addEffect({ type: 'ring', x: this.x, y: this.y - this.def.height / 2, r0: 20, r1: 120, life: 14, color: '#ffffff' });
+      Sound.play('chargeFull');
+    }
+    this.startMove(this.chargeMove);
+    this.chargeMult = mult;                           // used by Match.applyHit for this move
+    this.chargeFrames = 0;
+    this.squash = -0.2;
   }
 
   // ------------------------------------------------------- DEFENSIVE STATES
@@ -2015,7 +2486,25 @@ class Fighter {
     if (this.hitstun <= 0) this.state = this.grounded ? 'idle' : 'air';
   }
 
+  // Directional influence: when the launch starts, holding a direction
+  // rotates it by up to TUNING.diMaxDegrees (most when held sideways to it).
+  applyDI(inp) {
+    this.pendingDI = false;
+    const sx = dirOf(inp), sy = (inp.down ? 1 : 0) - (inp.up ? 1 : 0);
+    const ls = Math.hypot(this.kbx, this.kby);
+    if ((!sx && !sy) || ls < 3) return;
+    const cross = (this.kbx * sy - this.kby * sx) / (ls * Math.hypot(sx, sy));   // -1..1: how sideways the hold is
+    const a = cross * TUNING.diMaxDegrees * Math.PI / 180;
+    const cos = Math.cos(a), sin = Math.sin(a);
+    const nx = this.kbx * cos - this.kby * sin, ny = this.kbx * sin + this.kby * cos;
+    this.kbx = nx; this.kby = ny;
+    if (this.grounded && this.kby < -0.5) { this.grounded = false; this.platform = null; }
+  }
+
+  // Shield: hold to keep it up. A quick tap (release within shieldTapFrames)
+  // becomes a spot dodge; pressing a direction while shielding rolls.
   updateShield(inp) {
+    this.stateTimer++;
     this.vx = approach(this.vx, 0, 0.8);
     this.shieldHP -= 0.13;                           // the shield shrinks while held
     if (this.shieldHP <= 0) { this.breakShield(); return; }
@@ -2023,7 +2512,10 @@ class Fighter {
     if (inp.leftP || inp.rightP) { this.startDodge('roll', inp.leftP ? -1 : 1); return; }
     if (inp.downP) { this.startDodge('spot', 0); return; }
     if (this.jumpBuf) { this.jumpBuf = 0; this.state = 'jumpsquat'; this.stateTimer = 0; return; }
-    if (!inp.shield) this.state = 'idle';
+    if (!inp.shield) {
+      if (this.stateTimer <= TUNING.shieldTapFrames) this.startDodge('spot', 0);
+      else this.state = 'idle';
+    }
   }
 
   breakShield() {
@@ -2039,7 +2531,7 @@ class Fighter {
 
   startDodge(type, dirX, dirY = 0) {
     this.state = 'dodge'; this.dodgeType = type; this.dodgeDir = dirX; this.stateTimer = 0;
-    this.move = null;
+    this.move = null; this.moveName = '';
     this.moveData = {};
     if (type === 'air') {
       this.usedAirDodge = true;
@@ -2106,6 +2598,7 @@ class Fighter {
     fx(this, 8, 2, 0, -this.def.height);
   }
 
+  // Hanging: Up or Jump (or toward the stage, or attack) climbs; Down or away lets go.
   updateLedge(inp) {
     const L = this.ledge;
     this.stateTimer++;
@@ -2115,7 +2608,7 @@ class Fighter {
     const toward = L.side === 1 ? inp.leftP : inp.rightP;   // the stage is on the other side
     const away = L.side === 1 ? inp.rightP : inp.leftP;
     if (this.stateTimer > 8) {
-      if (this.jumpBuf || inp.upP || toward || this.attackBuf) {   // climb back up
+      if (this.jumpBuf || inp.upP || toward || this.attackBuf) {
         this.jumpBuf = 0; this.attackBuf = 0;
         this.state = 'ledgeclimb'; this.stateTimer = 0;
         return;
@@ -2143,6 +2636,7 @@ class Fighter {
       this.x = ex; this.y = ey;
       this.grounded = true; this.platform = L.platform;
       this.ledge = null; this.state = 'idle'; this.ledgeCooldown = 20;
+      this.squash = 0.15;
     }
   }
 
@@ -2159,7 +2653,7 @@ class Fighter {
     this.noGravity = true;
     this.vx = 0; this.vy = -0.5; this.kbx = this.kby = 0;
     // mash any button to escape faster
-    if (inp.attackP || inp.specialP || inp.upP || inp.leftP || inp.rightP || inp.downP || inp.shieldP) this.trapTimer -= 4;
+    if (inp.attackP || inp.specialP || inp.jumpP || inp.upP || inp.leftP || inp.rightP || inp.downP || inp.shieldP) this.trapTimer -= 4;
     if (--this.trapTimer <= 0) {
       this.state = 'hitstun'; this.hitstun = 14; this.kby = -5.5;
       Sound.play('pop');
@@ -2188,11 +2682,11 @@ class Fighter {
   // ------------------------------------------------------- DEATH / RESPAWN
   respawn() {
     const r = this.match.stage.respawn;
+    this.facing = this.index === 0 ? 1 : -1;
     this.resetForSpawn();
     this.percent = 0;
     this.x = r.x; this.y = r.y;
     this.state = 'respawn'; this.stateTimer = 0;
-    this.facing = this.index === 0 ? 1 : -1;
     this.invuln = 120;
   }
   updateRespawn(inp) {
@@ -2200,8 +2694,8 @@ class Fighter {
     this.invuln = 120;                                // invincible until you leave + 2 seconds
     const r = this.match.stage.respawn;
     this.x = r.x; this.y = r.y;
-    const anyInput = inp.left || inp.right || inp.down || inp.upP || inp.attackP || inp.specialP || inp.shieldP;
-    if ((this.stateTimer > 20 && anyInput) || this.stateTimer > 240) {
+    const anyInput = inp.left || inp.right || inp.down || inp.jumpP || inp.upP || inp.attackP || inp.specialP || inp.shieldP;
+    if ((this.stateTimer > 30 && anyInput) || this.stateTimer > 240) {
       this.state = 'air'; this.vy = 0;
     }
   }
@@ -2214,6 +2708,11 @@ class Fighter {
 
   // ---------------------------------------------------------------- PHYSICS
   physics() {
+    // Variable jump height: let go of jump while rising = short hop.
+    if (!this.grounded && this.jumpCutAllowed) {
+      if (this.vy >= 0 || this.state === 'hitstun') this.jumpCutAllowed = false;
+      else if (!this.inp.jump) { this.vy *= TUNING.jumpCutMult; this.jumpCutAllowed = false; }
+    }
     // Knockback slowly fades (it's separate from normal movement).
     const ls = Math.hypot(this.kbx, this.kby);
     if (ls > 0) {
@@ -2225,7 +2724,8 @@ class Fighter {
       const launching = this.state === 'hitstun' && ls > 7;
       if (!this.noGravity && !launching) {
         const maxFall = this.fastFalling ? this.def.fastFall : this.def.maxFall;
-        this.vy = Math.min(this.vy + this.def.gravity, maxFall);
+        const g = this.def.gravity * (this.vy > 0 ? TUNING.fallGravityMult : 1);   // heavier on the way down
+        this.vy = Math.min(this.vy + g, maxFall);
       }
     } else {
       this.vy = 0;
@@ -2235,17 +2735,30 @@ class Fighter {
     this.moveAndCollide();
   }
 
+  // Move in small substeps so even very fast fighters can't skip
+  // through a platform between two frames.
   moveAndCollide() {
+    const fastest = Math.max(Math.abs(this.vx + this.kbx), Math.abs(this.vy + this.kby));
+    const steps = Math.max(1, Math.ceil(fastest / TUNING.substepPixels));
+    for (let i = 0; i < steps; i++) this.collideStep(steps);
+  }
+
+  // One substep: moves 1/steps of this frame's velocity, then fixes collisions.
+  collideStep(steps) {
     const st = this.match.stage;
-    const dx = this.vx + this.kbx, dy = this.vy + this.kby;
+    const fullDy = this.vy + this.kby;
+    const dx = (this.vx + this.kbx) / steps, dy = fullDy / steps;
     const prevX = this.x, prevY = this.y;
     const h = this.curHeight();
+    // Feet that sank a few pixels into a solid platform (e.g. pulled by the
+    // void pit) get popped back on top instead of falling through it.
+    const SINK = 16;
 
     // 1. horizontal movement, then push out of solid walls
     this.x += dx;
     for (const p of st.platforms) {
       if (!p.solid) continue;
-      if (this.y > p.y + 1 && this.y - h < p.y + p.h && this.x + this.halfW > p.x && this.x - this.halfW < p.x + p.w) {
+      if (this.y > p.y + SINK && this.y - h < p.y + p.h && this.x + this.halfW > p.x && this.x - this.halfW < p.x + p.w) {
         this.x = prevX <= p.x + p.w / 2 ? p.x - this.halfW : p.x + p.w + this.halfW;
         this.vx = 0;
         this.kbx = this.state === 'hitstun' ? -this.kbx * 0.4 : 0;    // bounce off walls when launched
@@ -2267,17 +2780,18 @@ class Fighter {
       for (const p of st.platforms) {
         if (!p.solid && this.dropTimer > 0) continue;
         if (this.x < p.x - 4 || this.x > p.x + p.w + 4) continue;
-        if (prevY <= p.y + 0.5 && this.y >= p.y) {
-          if (this.state === 'hitstun' && dy > 9) {      // launched into the floor: bounce!
+        if (prevY <= p.y + (p.solid ? SINK : 0.5) && this.y >= p.y) {
+          if (this.state === 'hitstun' && fullDy > 9) {  // launched into the floor: bounce!
             this.y = p.y;
-            this.vy = 0; this.kby = -dy * 0.45;
+            this.vy = 0; this.kby = -fullDy * 0.45;
+            this.squash = 0.3;
             spawnDust(this.x, p.y, 8);
             this.match.shake(4);
             break;
           }
           this.y = p.y; this.vy = 0; this.kby = 0;
           this.grounded = true; this.platform = p;
-          this.land();
+          this.land(fullDy);
           break;
         }
       }
@@ -2292,21 +2806,24 @@ class Fighter {
     }
   }
 
-  // Called once when touching down on a platform.
-  land() {
+  // Called once when touching down on a platform (speed = how fast we hit it).
+  land(speed = 0) {
     this.airJumps = this.def.airJumps;
     this.fastFalling = false; this.usedSideSpecial = false; this.usedAirDodge = false;
+    this.jumpCutAllowed = false; this.coyote = 0; this.flipTimer = 0;
+    this.squash = clamp(0.12 + speed * 0.015, 0.12, 0.35);   // squash on landing
     switch (this.state) {
       case 'air':
-        this.state = 'landing'; this.stateTimer = 3;
-        spawnDust(this.x, this.y, 5); Sound.play('land');
+        this.state = 'landing'; this.stateTimer = TUNING.landingLag;
+        spawnDust(this.x, this.y, 6); Sound.play('land');
+        if (this.jumpBuf) { this.jumpBuf = 0; this.state = 'jumpsquat'; this.stateTimer = 0; }   // buffered jump
         break;
       case 'helpless':
-        this.state = 'landing'; this.stateTimer = 14;
+        this.state = 'landing'; this.stateTimer = TUNING.helplessLandingLag;
         spawnDust(this.x, this.y, 8); Sound.play('land');
         break;
       case 'attack':
-        if (this.move.aerial) {                            // aerials have landing lag
+        if (this.move.aerial) {                            // aerials have their own landing lag
           this.state = 'landing'; this.stateTimer = this.move.landingLag || 6;
           this.move = null; this.moveName = '';
           spawnDust(this.x, this.y, 5);
@@ -2323,7 +2840,10 @@ class Fighter {
 
   // Called when walking (or being pushed) off a platform edge.
   leaveGround() {
-    if (['idle', 'walk', 'crouch', 'landing', 'shield', 'jumpsquat'].includes(this.state)) this.state = 'air';
+    if (['idle', 'walk', 'crouch', 'landing', 'shield', 'jumpsquat', 'charging'].includes(this.state)) {
+      if (this.state !== 'jumpsquat' && this.state !== 'charging') this.coyote = TUNING.coyoteFrames;   // coyote time!
+      this.state = 'air';
+    }
   }
 
   // Pushes the fighter out of solid platforms (used after teleporting).
@@ -2349,29 +2869,85 @@ class Fighter {
       this.y - rand(0, this.def.height), 1, 0.6, { sizeMul: 0.6 });
   }
 
-  // ----------------------------------------------------------------- DRAWING
+  // -------------------------------------------------------------- ANIMATION
+  // Runs every frame after the gameplay update. Nothing here changes the
+  // gameplay - it only decides how the fighter LOOKS.
+  animate() {
+    this.visFacing = approach(this.visFacing, this.facing, 0.4);       // quick flip instead of an instant mirror
+    // squash & stretch is a little spring that wobbles back to normal
+    this.squashVel += -this.squash * 0.3;
+    this.squashVel *= 0.7;
+    this.squash += this.squashVel;
+    if (this.flipTimer > 0) this.flipTimer--;
+    if (this.chargeFlash > 0) this.chargeFlash--;
+    // run cycle speed follows movement speed; dust puffs on each footstep
+    if (this.grounded) {
+      const s = Math.abs(this.vx) / this.def.walkSpeed;
+      const before = Math.sin(this.runPhase);
+      this.runPhase += 0.12 + 0.2 * s;
+      if (this.state === 'walk' && s > 0.5 && Math.sign(Math.sin(this.runPhase)) !== Math.sign(before)) spawnDust(this.x - this.facing * 8, this.y, 2);
+    }
+    // tumble spin while launched hard
+    const ls = Math.hypot(this.kbx, this.kby);
+    if (this.state === 'hitstun' && ls > 9) this.tumble += (0.15 + ls * 0.02) * (this.kbx >= 0 ? 1 : -1) * this.facing;
+    else this.tumble = 0;
+    // ease the drawn pose toward the target pose (fast for attacks, softer otherwise)
+    const target = this.getPose();
+    const rate = this.state === 'attack' ? 0.75 : (this.state === 'hitstun' || this.state === 'dodge') ? 0.5 : 0.3;
+    this.animPose = this.animPose ? smoothPose(this.animPose, target, rate) : target;
+    // afterimages on fast movement
+    for (const g of this.trail) g.life--;
+    this.trail = this.trail.filter(g => g.life > 0);
+    if (this.wantsTrail() && this.animTime % 2 === 0 && !this.invisible) {
+      this.trail.push({ x: this.x, y: this.y, facing: this.visFacing, pose: Object.assign({}, this.animPose), life: 10 });
+      if (this.trail.length > 5) this.trail.shift();
+    }
+  }
+
+  wantsTrail() {
+    if (this.state === 'dodge') return true;
+    if (this.state === 'attack' && this.move && (this.move.trail || (this.move.charge && this.activeHitboxes().length))) return true;
+    if (this.fastFalling && this.vy > 8) return true;
+    return Math.hypot(this.vx + this.kbx, this.vy + this.kby) > 11;
+  }
+
   getPose() {
     const t = this.animTime;
     switch (this.state) {
       case 'idle': case 'respawn': return POSES.idle(t);
-      case 'walk': return POSES.walk(t, clamp(Math.abs(this.vx) / this.def.walkSpeed, 0.2, 1));
+      case 'walk': return POSES.run(this.runPhase, clamp(Math.abs(this.vx) / this.def.walkSpeed, 0.15, 1));
       case 'crouch': case 'jumpsquat': case 'landing': return POSES.crouch(t);
-      case 'air': return this.vy < 0 ? POSES.jump(t) : POSES.fall(t);
+      case 'air': {
+        if (this.flipTimer > 0) { const p = POSES.tuck(t); p.rot = easeOutCubic(1 - this.flipTimer / 22) * Math.PI * 2; return p; }
+        if (this.fastFalling) return POSES.fastfall(t);
+        if (this.vy < -4) return POSES.rise(t);      // stretched on the way up
+        if (this.vy < 3) return POSES.tuck(t);       // tucked at the peak
+        return POSES.fall(t);
+      }
       case 'helpless': return POSES.helpless(t);
       case 'hitstun': case 'trapped': case 'grabbed': {
         const p = POSES.hurt(t);
-        if (Math.hypot(this.kbx, this.kby) > 9) p.rot = t * 0.35;      // tumble when launched
+        p.rot = this.tumble;                          // spin when launched
         return p;
       }
       case 'shield': return POSES.guard(t);
       case 'dodge': {
         const p = POSES.dodge(t);
-        if (this.dodgeType === 'roll') p.rot = this.dodgeDir * this.facing * (this.stateTimer / 28) * Math.PI * 2;
+        if (this.dodgeType === 'roll') p.rot = this.dodgeDir * this.facing * easeInOutSine(Math.min(1, this.stateTimer / 26)) * Math.PI * 2;
+        if (this.dodgeType === 'air') p.rot = easeOutCubic(Math.min(1, this.stateTimer / 24)) * Math.PI * 2;
         return p;
       }
       case 'ledge': return POSES.hang(t);
       case 'ledgeclimb': return POSES.climb(t);
       case 'shieldbreak': return POSES.dizzy(t);
+      case 'charging': {                              // hold the wind-up of the charged move, trembling
+        const m = this.def.moves[this.chargeMove];
+        const def = ATTACK_POSES[m.pose] || ATTACK_POSES.punch;
+        const p = Object.assign(POSES.idle(t), def.wind);
+        p.crouch = (p.crouch || 0) + 0.15;
+        p.yOff = (p.yOff || 0) + Math.sin(t * 1.7) * 1.2;
+        return p;
+      }
       case 'attack': {
         const m = this.move, f = this.moveFrame;
         const base = this.grounded ? POSES.idle(t) : POSES.jump(t);
@@ -2382,28 +2958,97 @@ class Fighter {
     return POSES.idle(t);
   }
 
+  // A crescent "swipe" in the element colour that follows the strike.
+  drawSwipe(c) {
+    const m = this.move;
+    if (this.state !== 'attack' || !m || !m.swipe || !m.hitboxes.length) return;
+    const hb = m.hitboxes[0], f = this.moveFrame;
+    if (f < hb.start || f > hb.end + 6 || hb.w > 300 || hb.h > 300) return;
+    const fade = f <= hb.end ? 1 : 1 - (f - hb.end) / 7;
+    const d = this.facing, pal = this.palette;
+    const cx = this.x, cy = this.y - this.def.height * 0.55;
+    const hx = this.x + hb.x * d, hy = this.y + hb.y;
+    c.save();
+    c.globalCompositeOperation = 'lighter';
+    if (hb.radial && Math.abs(hb.x) < 20) {            // spinning moves: a full ring
+      const r = Math.min(hb.w, hb.h) / 2;
+      c.strokeStyle = rgba(pal.glow, 0.6 * fade); c.lineWidth = 10 * fade + 2;
+      c.beginPath(); c.arc(hx, hy, r, 0, Math.PI * 2); c.stroke();
+      c.strokeStyle = rgba(pal.light, 0.8 * fade); c.lineWidth = 3;
+      c.beginPath(); c.arc(hx, hy, r, this.animTime * 0.4, this.animTime * 0.4 + 2.2); c.stroke();
+    } else {
+      const ang = Math.atan2(hy - cy, hx - cx);
+      const r = Math.max(34, Math.hypot(hx - cx, hy - cy) + Math.min(hb.w, hb.h) * 0.35);
+      const span = 1.6, progress = clamp((f - hb.start + 1) / Math.max(1, hb.end - hb.start + 1), 0.35, 1);
+      const a0 = ang - d * span / 2, a1 = a0 + d * span * progress;
+      const g = c.createRadialGradient(cx, cy, r * 0.6, cx, cy, r);
+      g.addColorStop(0, rgba(pal.glow, 0)); g.addColorStop(0.7, rgba(pal.glow, 0.55 * fade)); g.addColorStop(1, rgba(pal.light, 0.9 * fade));
+      c.fillStyle = g;
+      c.beginPath();
+      c.arc(cx, cy, r, a0, a1, d < 0);
+      c.arc(cx, cy, r * 0.68, a1, a0, d > 0);
+      c.closePath(); c.fill();
+    }
+    c.restore();
+  }
+
   draw(c) {
     if (this.state === 'dead' || this.state === 'out') return;
     const pal = this.palette, def = this.def;
-    if (this.state === 'respawn') drawRespawnPlatform(c, this.x, this.y, pal, this.stateTimer);
+    // respawn entrance: drop in from above inside a beam of light
+    let dropY = 0;
+    if (this.state === 'respawn') {
+      const k = Math.min(1, this.stateTimer / 24);
+      dropY = -(1 - easeOutCubic(k)) * 260;
+      if (k < 1) {
+        c.save(); c.globalCompositeOperation = 'lighter';
+        const g = c.createLinearGradient(this.x - 40, 0, this.x + 40, 0);
+        g.addColorStop(0, rgba(pal.glow, 0)); g.addColorStop(0.5, rgba(pal.light, 0.6 * (1 - k))); g.addColorStop(1, rgba(pal.glow, 0));
+        c.fillStyle = g; c.fillRect(this.x - 40, this.y - 900, 80, 900);
+        c.restore();
+      }
+      drawRespawnPlatform(c, this.x, this.y, pal, this.stateTimer);
+    }
     if (this.state === 'attack' && this.move.drawBehind) this.move.drawBehind(c, this);
+    // afterimages
+    for (const g of this.trail) {
+      drawFighter(c, def, this.ghostPalette, g.x, g.y, g.facing, g.pose, { alpha: (g.life / 10) * 0.35, ghost: true, time: this.animTime });
+    }
     if (this.invisible) return;
 
     let alpha = 1;
     if (this.invuln > 0 && Math.floor(this.animTime / 4) % 2 === 0) alpha = 0.4;   // flashing while invincible
     if (this.intangible && this.state === 'dodge') alpha = 0.5;
-    const shakeX = this.hitlag > 0 && this.state === 'hitstun' ? rand(-3, 3) : 0;
-    const flash = this.state === 'hitstun' && this.hitlag > 0;
+    let shakeX = this.hitlag > 0 && this.state === 'hitstun' ? rand(-3, 3) : 0, shakeY = 0;
+    let aura = 0;
+    const cx = this.x, cy = this.y - def.height / 2;
+    if (this.state === 'charging') {                 // growing glow + trembling while charging
+      const k = this.chargeFrames / CHARGE_MAX_FRAMES;
+      shakeX += rand(-1, 1) * (0.5 + 2 * k); shakeY = rand(-1, 1) * (0.5 + 1.5 * k);
+      aura = 0.1 + 0.45 * k;
+      const r = def.height * (0.6 + 0.7 * k);
+      c.save(); c.globalCompositeOperation = 'lighter';
+      const g = c.createRadialGradient(cx, cy, 0, cx, cy, r);
+      g.addColorStop(0, rgba(pal.light, 0.15 + 0.35 * k)); g.addColorStop(0.5, rgba(pal.glow, 0.2 + 0.4 * k)); g.addColorStop(1, rgba(pal.glow, 0));
+      c.fillStyle = g; c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2); c.fill();
+      c.strokeStyle = rgba(pal.light, 0.3 + 0.5 * k); c.lineWidth = 2;
+      c.beginPath(); c.arc(cx, cy, r * (0.75 + 0.1 * Math.sin(this.animTime * 0.6)), 0, Math.PI * 2); c.stroke();
+      c.restore();
+    }
+    const flash = this.hitFlash > 0 || this.chargeFlash > 0;
+    const vf = Math.abs(this.visFacing) < 0.15 ? 0.15 * this.facing : this.visFacing;
+    const sq = clamp(this.squash, -0.4, 0.45);
     const strike = this.state === 'attack' && this.activeHitboxes().length > 0;
-    drawFighter(c, def, flash ? FLASH_PALETTE : pal, this.x + shakeX, this.y, this.facing, this.getPose(), {
+    drawFighter(c, def, flash ? FLASH_PALETTE : pal, this.x + shakeX, this.y + dropY + shakeY, vf, this.animPose || this.getPose(), {
       alpha, time: this.animTime, wings: this.state === 'attack' && this.moveData.wings,
-      charge: this.state === 'attack' ? this.moveData.charge : 0, glow: strike,
+      charge: this.state === 'attack' ? this.moveData.charge : 0, glow: strike, auraBoost: aura,
+      sx: 1 + sq * 0.6, sy: 1 - sq,
     });
+    this.drawSwipe(c);
     if (this.state === 'attack' && this.move.draw) this.move.draw(c, this);
 
-    const cx = this.x, cy = this.y - def.height / 2;
-    if (this.state === 'shield') {                     // shield bubble shrinks with its health
-      const r = def.height * 0.62 * (0.35 + 0.65 * this.shieldHP / MAX_SHIELD);
+    if (this.state === 'shield') {                     // shield bubble: pulses, shrinks with its health
+      const r = def.height * 0.62 * (0.35 + 0.65 * this.shieldHP / MAX_SHIELD) * (1 + 0.04 * Math.sin(this.animTime * 0.3));
       c.save(); c.globalCompositeOperation = 'lighter';
       const g = c.createRadialGradient(cx, cy, r * 0.3, cx, cy, r);
       g.addColorStop(0, rgba(pal.glow, 0.05)); g.addColorStop(1, rgba(pal.glow, 0.55));
@@ -2431,10 +3076,11 @@ class Fighter {
       c.restore();
     }
     // player marker above the head
-    const my = this.y - def.height - 30;
+    const my = this.y + dropY - def.height - 30;
     c.fillStyle = PLAYER_COLORS[this.index];
     c.beginPath(); c.moveTo(cx - 8, my); c.lineTo(cx + 8, my); c.lineTo(cx, my + 9); c.closePath(); c.fill();
-    drawText(c, 'P' + (this.index + 1), cx, my - 10, { size: 13, color: PLAYER_COLORS[this.index], stroke: 3, strokeColor: '#000' });
+    const tag = this.match.online && this.index === this.match.localIndex ? 'YOU' : 'P' + (this.index + 1);
+    drawText(c, tag, cx, my - 10, { size: 13, color: PLAYER_COLORS[this.index], stroke: 3, strokeColor: '#000' });
   }
 }
 
@@ -2614,13 +3260,19 @@ const PROJECTILE_KINDS = {
       p.vx = 0; p.vy = 0;
       const radius = 210;
       for (const f of p.match.fighters) {
-        if (f === p.owner || !f.canBeHit() || f.state === 'ledge' || f.state === 'grabbed') continue;
+        if (f === p.owner || !f.canBeHit() || f.hitlag > 0 || f.state === 'ledge' || f.state === 'grabbed') continue;
         const dx = p.x - f.x, dy = p.y - (f.y - f.def.height / 2);
         const d = Math.hypot(dx, dy);
         if (d < radius) {
           const pull = 2.2 * (1 - d / radius) + 0.4;
           f.x += Math.sign(dx) * Math.min(Math.abs(dx), pull);
-          if (!f.grounded) f.y += Math.sign(dy) * Math.min(Math.abs(dy), pull * 0.6);
+          if (!f.grounded) {
+            const oldY = f.y;
+            f.y += Math.sign(dy) * Math.min(Math.abs(dy), pull * 0.6);
+            for (const s of p.match.stage.platforms) {   // never pull someone down into a solid floor
+              if (s.solid && f.x > s.x && f.x < s.x + s.w && oldY <= s.y && f.y > s.y) f.y = s.y;
+            }
+          }
           if (p.age % 20 === 0) {                     // small damage over time
             f.percent = Math.min(999, f.percent + 1);
             p.owner.stats.damageDealt += 1;
@@ -2668,8 +3320,12 @@ const PROJECTILE_KINDS = {
    ======================================================================= */
 
 class Match {
-  constructor(sel) {
+  // opts.online = true for an online game; opts.localIndex = which fighter is "you" (0 or 1).
+  constructor(sel, opts = {}) {
     this.sel = sel;
+    this.online = !!opts.online;
+    this.localIndex = opts.localIndex || 0;
+    this.inputs = null;                              // online: [P1 input, P2 input] for this frame
     this.stage = STAGES[sel.stage] || STAGES[0];
     const sameFighter = sel.p1 === sel.p2;           // mirror match: P2 gets the alternate colours
     this.fighters = [new Fighter(this, 0, sel.p1, false), new Fighter(this, 1, sel.p2, sameFighter)];
@@ -2687,11 +3343,12 @@ class Match {
     this.slowAcc = 0;
     this.paused = false;
     this.pauseMenu = new Menu([
-      { label: 'RESUME', x: 470, y: 300, w: 340, h: 56, action: () => { this.paused = false; } },
-      { label: 'RESTART', x: 470, y: 372, w: 340, h: 56, action: () => Game.setScreen('fight') },
-      { label: 'QUIT TO CHARACTER SELECT', x: 470, y: 444, w: 340, h: 56, action: () => Game.setScreen('charSelect') },
+      { label: 'RESUME', x: 470, y: 280, w: 340, h: 54, action: () => { this.paused = false; } },
+      { label: 'RESTART', x: 470, y: 344, w: 340, h: 54, action: () => Game.setScreen('fight') },
+      { label: 'CONTROLS', x: 470, y: 408, w: 340, h: 54, action: () => Game.setScreen('controls', { from: 'pause' }) },
+      { label: 'QUIT TO CHARACTER SELECT', x: 470, y: 472, w: 340, h: 54, action: () => Game.setScreen('charSelect') },
     ]);
-    particles.length = 0;
+    clearParticles();
     this.updateCamera(true);
   }
 
@@ -2699,9 +3356,17 @@ class Match {
   addEffect(e) { e.maxLife = e.life; this.effects.push(e); }
   viewTop() { return this.cam.y - H / 2 / this.cam.zoom; }
 
+  // Where a fighter's buttons come from this frame.
+  inputFor(index) {
+    if (this.inputs) return this.inputs[index];     // online: sent over the network
+    return readPlayerInput(CONTROLS[index]);         // local: straight from the keyboard/mouse
+  }
+
   // ------------------------------------------------------------- UPDATE
   update() {
-    if (Input.wasPressed('Escape') && this.phase !== 'ending') {
+    // (online matches can't pause - the other player's game keeps going - so
+    // the online screen shows its own menu instead, see SCREENS.onlineFight)
+    if (!this.online && Input.wasPressed('Escape') && this.phase !== 'ending') {
       this.paused = !this.paused;
       this.pauseMenu.index = 0;
       Sound.play('pause');
@@ -2756,7 +3421,8 @@ class Match {
           if (last !== undefined && !(hb.rehit && a.moveFrame - last >= hb.rehit)) continue;
           if (!rectsOverlap(rect, hurt)) continue;
           a.hitSet.set(key, a.moveFrame);
-          this.resolveHit(a, t, hb, { srcX: a.x, srcY: a.y - a.def.height / 2, dir: a.facing, rect });
+          const mult = a.move.charge ? a.chargeMult : 1;      // charged attacks hit harder
+          this.resolveHit(a, t, hb, { srcX: a.x, srcY: a.y - a.def.height / 2, dir: a.facing, rect, mult });
           break;
         }
       }
@@ -2766,7 +3432,7 @@ class Match {
   // Decide what happens when a hit connects: counter, shield, or a real hit.
   resolveHit(a, t, hb, opts = {}) {
     if (t.isCountering()) {
-      this.triggerCounter(t, a, hb.dmg || 0);
+      this.triggerCounter(t, a, (hb.dmg || 0) * (opts.mult || 1));
       if (!opts.projectile) a.hitlag = 16;
       return 'counter';
     }
@@ -2786,7 +3452,7 @@ class Match {
   }
 
   shieldHit(a, t, hb, opts) {
-    const dmg = hb.dmg || 0;
+    const dmg = (hb.dmg || 0) * (opts.mult || 1);
     t.shieldHP -= dmg * 1.1 + 1;
     t.shieldStun = Math.floor(dmg * 0.5) + 3;
     const dir = t.x >= (opts.srcX !== undefined ? opts.srcX : a.x) ? 1 : -1;
@@ -2801,7 +3467,8 @@ class Match {
 
   // THE CORE OF THE GAME: apply damage and knockback.
   applyHit(a, t, hb, opts = {}) {
-    const dmg = hb.counterDmg ? a.counterDmg : (hb.dmg || 0);
+    const mult = opts.mult || 1;                       // > 1 for charged attacks
+    const dmg = (hb.counterDmg ? a.counterDmg : (hb.dmg || 0)) * mult;
     t.percent = Math.min(999, t.percent + dmg);
     if (a !== t) a.stats.damageDealt += dmg;
     t.lastHitBy = a;
@@ -2830,7 +3497,8 @@ class Match {
 
     // --- knockback formula ---
     // knockback = base + (percent * scaling * damage / 10) * (100 / (weight + 100))
-    const kb = hb.bkb + (t.percent * hb.kbs * dmg / 10) * (100 / (t.def.weight + 100));
+    // (charged attacks multiply the whole result by their charge multiplier)
+    const kb = (hb.bkb + (t.percent * hb.kbs * (dmg / mult) / 10) * (100 / (t.def.weight + 100))) * mult;
     const srcX = opts.srcX !== undefined ? opts.srcX : a.x;
     let dir = opts.dir !== undefined ? opts.dir : a.facing;
     if (hb.radial) dir = t.x >= srcX ? 1 : -1;         // push away from the centre
@@ -2846,12 +3514,16 @@ class Match {
     if (t.grabbing) t.grabbing = null;
     if (ky < -0.5) { t.grounded = false; t.platform = null; }
     t.kbx = kx; t.kby = ky; t.vx = 0; t.vy = 0;
-    t.fastFalling = false;
+    t.fastFalling = false; t.jumpCutAllowed = false; t.coyote = 0;
+    t.chargeFrames = 0;                                // getting hit while charging loses the charge
     t.state = 'hitstun';
     t.hitstun = Math.max(6, Math.round(kb * HITSTUN_MULT));   // hitstun grows with knockback
+    t.pendingDI = kb > 3;                              // DI is read when the hitstop ends
+    t.hitFlash = 3; t.hudPop = 10;
+    t.squash = kb > 10 ? 0.3 : 0.15;
 
-    // hitlag: both fighters freeze for a moment so hits feel heavy
-    const lag = Math.min(16, Math.floor(3 + dmg * 0.45));
+    // hitstop: both fighters freeze for 3-10 frames so hits feel heavy
+    const lag = clamp(Math.floor(TUNING.hitstopMin + dmg * TUNING.hitstopPerDamage), TUNING.hitstopMin, TUNING.hitstopMax);
     t.hitlag = lag;
     if (!opts.projectile) a.hitlag = lag;
 
@@ -2860,8 +3532,14 @@ class Match {
     // juice!
     emitElement(a.def.element, a.palette.fx, hx, hy, Math.floor(8 + dmg * 1.5), 3 + kb * 0.25);
     spawnParticle({ x: hx, y: hy, life: 12, size: 8, grow: 20 + kb * 2, color: '#ffffff', shape: 'ring', drag: 1 });
+    for (let i = 0; i < 8; i++) {                      // white hit sparks
+      const a2 = rand(0, Math.PI * 2), sp = rand(6, 12) + kb * 0.2;
+      spawnParticle({ x: hx, y: hy, vx: Math.cos(a2) * sp, vy: Math.sin(a2) * sp, life: rand(6, 11), size: 2.5,
+        color: '#ffffff', shape: 'spark', glow: true, drag: 0.8 });
+    }
     if (kb > 14) {
       this.shake(kb * 0.5);
+      this.flash = Math.max(this.flash, Math.min(0.3, kb * 0.01));   // short white flash on strong hits
       this.addEffect({ type: 'ring', x: hx, y: hy, r0: 10, r1: 60 + kb * 3, life: 14, color: a.palette.glow });
       Sound.play('hitHeavy');
     } else Sound.play('hit');
@@ -2939,6 +3617,7 @@ class Match {
   finish() {
     const alive = this.fighters.filter(f => f.stocks > 0);
     Game.lastResult = {
+      online: this.online,
       winner: alive.length === 1 ? alive[0].index : -1,
       players: this.fighters.map(f => ({ id: f.id, palette: f.palette, name: f.def.name, stats: Object.assign({}, f.stats), stocks: f.stocks })),
     };
@@ -3026,10 +3705,14 @@ class Match {
     switch (e.type) {
       case 'ring':
         c.strokeStyle = rgba(e.color, k); c.lineWidth = 6 * k + 1;
-        c.beginPath(); c.arc(e.x, e.y, Math.max(1, lerp(e.r0, e.r1, 1 - k)), 0, Math.PI * 2); c.stroke();
+        c.beginPath();
+        const rr = Math.max(1, lerp(e.r0, e.r1, 1 - k));
+        if (e.flat) c.ellipse(e.x, e.y, rr, rr * 0.28, 0, 0, Math.PI * 2);   // a ring along the ground
+        else c.arc(e.x, e.y, rr, 0, Math.PI * 2);
+        c.stroke();
         break;
       case 'beam': {                                  // Lumen's laser
-        const o = e.owner, y = o.y - 60, x0 = o.x + o.facing * 30, x1 = x0 + o.facing * 640;
+        const o = e.owner, y = o.y + (e.oy || -60), x0 = o.x + o.facing * 30, x1 = x0 + o.facing * (e.len || 640);
         const w = 30 * k + 4;
         c.lineCap = 'round';
         c.strokeStyle = rgba(e.color, 0.45); c.lineWidth = w * 2;
@@ -3055,7 +3738,7 @@ class Match {
         break;
       }
       case 'geyser': {                                // Tide's water column
-        const hgt = 260 * Math.min(1, (1 - k) * 3);
+        const hgt = (e.h || 260) * Math.min(1, (1 - k) * 3);
         const g = c.createLinearGradient(0, e.y, 0, e.y - hgt);
         g.addColorStop(0, rgba(e.color, 0.7 * k)); g.addColorStop(1, rgba(e.color2, 0));
         c.fillStyle = g;
@@ -3120,6 +3803,7 @@ class Match {
       drawPortrait(c, f.id, f.palette, cx - 150, top + 12, 76, 76, this.timer, { circle: true });
       c.beginPath(); c.arc(cx - 112, top + 50, 38, 0, Math.PI * 2); c.lineWidth = 3; c.strokeStyle = col; c.stroke();
       drawText(c, 'P' + (i + 1), cx - 140, top + 12, { size: 14, color: col, stroke: 3 });
+      if (this.online) drawText(c, i === this.localIndex ? 'YOU' : 'RIVAL', cx, top - 12, { size: 16, color: col, stroke: 4 });
       drawText(c, f.def.name, cx - 64, top + 26, { size: 20, align: 'left', color: '#ffffff' });
       // stock icons
       for (let s = 0; s < START_STOCKS; s++) {
@@ -3134,7 +3818,8 @@ class Match {
       } else {
         const sh = f.hudShake > 0 ? rand(-1, 1) * f.hudShake * 0.4 : 0;
         const pct = Math.floor(f.percent);
-        drawText(c, String(pct), cx + 112 + sh, top + 56 + sh, { size: 54, align: 'right', color: damageColor(f.percent),
+        const pop = 1 + 0.35 * easeOutCubic(f.hudPop / 10);       // the number pops bigger when it goes up
+        drawText(c, String(pct), cx + 112 + sh, top + 56 + sh, { size: Math.round(54 * pop), align: 'right', color: damageColor(f.percent),
           font: TITLE_FONT, weight: 'normal', stroke: 6, strokeColor: '#1a0b2a' });
         drawText(c, '%', cx + 136 + sh, top + 66 + sh, { size: 26, color: damageColor(f.percent), font: TITLE_FONT, weight: 'normal', stroke: 4, strokeColor: '#1a0b2a' });
       }
@@ -3144,9 +3829,9 @@ class Match {
 
   drawPause(c) {
     c.fillStyle = 'rgba(5,3,15,0.7)'; c.fillRect(0, 0, W, H);
-    drawText(c, 'PAUSED', W / 2, 220, { size: 80, font: TITLE_FONT, weight: 'normal', color: '#ffe27a', stroke: 8, strokeColor: '#2a0f40' });
+    drawText(c, 'PAUSED', W / 2, 205, { size: 80, font: TITLE_FONT, weight: 'normal', color: '#ffe27a', stroke: 8, strokeColor: '#2a0f40' });
     this.pauseMenu.draw(c);
-    drawText(c, 'Esc to resume  ·  W/S or ↑/↓ to choose  ·  Enter / F / K to select', W / 2, 545, { size: 16, weight: 'normal', color: '#c9bde6' });
+    drawText(c, 'Esc to resume  ·  W/S or ↑/↓ to choose  ·  Enter / Space or click to select', W / 2, 565, { size: 16, weight: 'normal', color: '#c9bde6' });
   }
 
   drawDebug(c) {
@@ -3313,11 +3998,14 @@ const Game = {
   sel: { p1: 'pyro', p2: 'tide', stage: 0 },
   match: null,
   lastResult: null,
-  setScreen(name) {
+  toastText: '', toastTimer: 0,
+  // A short message that floats at the bottom of the screen for a few seconds.
+  toast(text) { this.toastText = text; this.toastTimer = 300; },
+  setScreen(name, opts) {
     this.screen = name;
-    particles.length = 0;
+    clearParticles();
     const s = SCREENS[name];
-    if (s.enter) s.enter();
+    if (s.enter) s.enter(opts);
   },
 };
 
@@ -3327,9 +4015,10 @@ const SCREENS = {};
 SCREENS.home = {
   enter() {
     this.menu = new Menu([
-      { label: 'PLAY', x: 490, y: 320, w: 300, h: 64, size: 28, action: () => Game.setScreen('charSelect') },
-      { label: 'CONTROLS', x: 490, y: 400, w: 300, h: 64, size: 28, action: () => Game.setScreen('controls') },
-      { label: 'CREDITS', x: 490, y: 480, w: 300, h: 64, size: 28, action: () => Game.setScreen('credits') },
+      { label: 'PLAY', x: 490, y: 296, w: 300, h: 60, size: 28, action: () => Game.setScreen('charSelect') },
+      { label: 'PLAY ONLINE', x: 490, y: 368, w: 300, h: 60, size: 28, action: () => Game.setScreen('online') },
+      { label: 'CONTROLS', x: 490, y: 440, w: 300, h: 60, size: 28, action: () => Game.setScreen('controls') },
+      { label: 'CREDITS', x: 490, y: 512, w: 300, h: 60, size: 28, action: () => Game.setScreen('credits') },
     ]);
   },
   update() { updateMenuParticles(); this.menu.update(); },
@@ -3347,51 +4036,109 @@ SCREENS.home = {
     drawTitle(c, 150, 104);
     drawText(c, 'FIVE ELEMENTS  ·  ONE SHRINE  ·  NO MERCY', W / 2, 232, { size: 22, color: '#d8c8ff', weight: 'bold' });
     this.menu.draw(c);
-    drawText(c, 'W/S or ↑/↓ to choose  ·  Enter / F / K or click to select  ·  M to mute', W / 2, 590, { size: 16, weight: 'normal', color: '#b7a8dc' });
+    drawText(c, 'W/S or ↑/↓ to choose  ·  Enter / Space or click to select  ·  M to mute', W / 2, 600, { size: 16, weight: 'normal', color: '#b7a8dc' });
   },
 };
 
 // -------------------------------------------------------------- CONTROLS
+// Shows every action for both players. Click (or select + Enter) an action,
+// then press any key or mouse button to bind it. Esc cancels.
 SCREENS.controls = {
-  enter() { this.menu = new Menu([{ label: 'BACK', x: 540, y: 630, w: 200, h: 56, action: () => Game.setScreen('home') }]); },
+  enter(opts = {}) {
+    this.from = opts.from || 'home';     // the screen to go back to ('pause' = the paused match)
+    if (this.from === 'onlineLobby') Net.setReady(false);   // can't be "ready" while rebinding
+    this.listening = null;               // { p, action } while waiting for a key
+    this.msg = ''; this.msgTimer = 0; this.msgWarn = false;
+    this.sel = { col: 0, row: 0 };       // keyboard cursor: rows 0-7 actions, 8 reset, 9 back
+  },
+  rowRect(p, i) { return { x: p === 0 ? 150 : 670, y: 138 + i * 44, w: 460, h: 38 }; },
+  resetRect(p) { return { x: (p === 0 ? 150 : 670) + 120, y: 498, w: 220, h: 42 }; },
+  backRect: { x: 520, y: 642, w: 240, h: 50 },
+  setMsg(text) { this.msg = text; this.msgTimer = 240; this.msgWarn = text.startsWith('Warning'); },
+  leave() {
+    Sound.play('back');
+    if (this.from === 'pause' && Game.match) Game.setScreen('fight', { resume: true });
+    else Game.setScreen(this.from === 'pause' ? 'home' : this.from);
+  },
+  activate(col, row) {
+    if (row < ACTIONS.length) { this.listening = { p: col, action: ACTIONS[row] }; Sound.play('menuSelect'); }
+    else if (row === ACTIONS.length) { resetControls(col); Sound.play('menuSelect'); this.setMsg('Player ' + (col + 1) + ' controls reset to default'); }
+    else this.leave();
+  },
   update() {
     updateMenuParticles();
-    if (menuPressed('back')) { Sound.play('back'); Game.setScreen('home'); return; }
-    this.menu.update();
+    if (this.msgTimer > 0) this.msgTimer--;
+    if (this.listening) {
+      // the next key or mouse button pressed becomes the new binding
+      const code = Object.keys(Input.pressed)[0];
+      if (!code) return;
+      if (code === 'Escape') { this.listening = null; this.setMsg('Cancelled'); Sound.play('back'); return; }
+      this.setMsg(rebind(this.listening.p, this.listening.action, code));
+      this.listening = null;
+      Mouse.clicked = false;             // this click was a binding, not a button press
+      Sound.play('lock');
+      return;
+    }
+    if (menuPressed('back')) { this.leave(); return; }
+    const rows = ACTIONS.length + 2;
+    if (menuPressed('up')) { this.sel.row = (this.sel.row - 1 + rows) % rows; Sound.play('menuMove'); }
+    if (menuPressed('down')) { this.sel.row = (this.sel.row + 1) % rows; Sound.play('menuMove'); }
+    if (menuPressed('left') || menuPressed('right')) { this.sel.col = 1 - this.sel.col; Sound.play('menuMove'); }
+    // mouse
+    for (let p = 0; p < 2; p++) {
+      for (let i = 0; i <= ACTIONS.length; i++) {
+        const r = i < ACTIONS.length ? this.rowRect(p, i) : this.resetRect(p);
+        if (!pointInRect(Mouse, r)) continue;
+        if (Mouse.moved) this.sel = { col: p, row: i };
+        if (Mouse.clicked) { this.sel = { col: p, row: i }; this.activate(p, i); return; }
+      }
+    }
+    if (pointInRect(Mouse, this.backRect)) {
+      if (Mouse.moved) this.sel.row = ACTIONS.length + 1;
+      if (Mouse.clicked) { this.leave(); return; }
+    }
+    if (menuPressed('confirm')) this.activate(this.sel.col, this.sel.row);
   },
   draw(c) {
     drawMenuBackground(c);
-    drawText(c, 'CONTROLS', W / 2, 60, { size: 64, font: TITLE_FONT, weight: 'normal', color: '#ffe27a', stroke: 8, strokeColor: '#2a0f40' });
-    const rows = [
-      ['Move', 'A / D', '← / →'],
-      ['Jump (again in air = double jump)', 'W', '↑'],
-      ['Crouch / fast-fall / drop through', 'S', '↓'],
-      ['Basic attack', 'F', 'K'],
-      ['Special attack', 'G', 'L'],
-      ['Shield (hold)', 'H', ';'],
-      ['Dodge', 'H + direction', '; + direction'],
-    ];
-    c.save();
-    roundRect(c, 140, 110, 1000, 330, 18); c.fillStyle = 'rgba(10,6,25,0.75)'; c.fill();
-    c.strokeStyle = 'rgba(255,255,255,0.2)'; c.lineWidth = 2; c.stroke();
-    c.restore();
-    drawText(c, 'ACTION', 200, 140, { size: 18, align: 'left', color: '#b7a8dc' });
-    drawText(c, 'PLAYER 1', 790, 140, { size: 20, color: PLAYER_COLORS[0] });
-    drawText(c, 'PLAYER 2', 1000, 140, { size: 20, color: PLAYER_COLORS[1] });
-    rows.forEach((r, i) => {
-      const y = 182 + i * 38;
-      drawText(c, r[0], 200, y, { size: 20, align: 'left', weight: 'normal' });
-      drawText(c, r[1], 790, y, { size: 22, color: '#ffd3d3' });
-      drawText(c, r[2], 1000, y, { size: 22, color: '#d3e6ff' });
-    });
-    const tips = [
-      'Hold a direction while pressing attack or special for side, up and down moves.',
-      'Attacks in the air are aerials (forward / back / up / down / neutral). Up + Special is always a recovery.',
-      'Tap jump for a short hop. Press attack again during a jab for a combo. Grab the ledge to recover!',
-      'Esc = pause    ·    ` (backtick) = show hitboxes    ·    M = mute',
-    ];
-    tips.forEach((t, i) => drawText(c, t, W / 2, 478 + i * 34, { size: 18, weight: 'normal', color: i === 3 ? '#ffe27a' : '#e0d6ff' }));
-    this.menu.draw(c);
+    drawText(c, 'CONTROLS', W / 2, 52, { size: 60, font: TITLE_FONT, weight: 'normal', color: '#ffe27a', stroke: 8, strokeColor: '#2a0f40' });
+    drawText(c, 'Click an action (or select it and press Enter), then press any key or mouse button. Esc cancels.',
+      W / 2, 92, { size: 16, weight: 'normal', color: '#d8c8ff' });
+    for (let p = 0; p < 2; p++) {
+      const col = PLAYER_COLORS[p], hx = p === 0 ? 380 : 900;
+      drawText(c, 'PLAYER ' + (p + 1), hx, 118, { size: 22, color: col });
+      ACTIONS.forEach((a, i) => {
+        const r = this.rowRect(p, i);
+        const selected = this.sel.row === i && this.sel.col === p;
+        const listening = this.listening && this.listening.p === p && this.listening.action === a;
+        c.save();
+        roundRect(c, r.x, r.y, r.w, r.h, 10);
+        c.fillStyle = listening ? rgba(col, 0.45) : selected ? 'rgba(255,255,255,0.16)' : 'rgba(10,6,25,0.72)';
+        c.fill();
+        c.lineWidth = selected || listening ? 3 : 1.5;
+        c.strokeStyle = selected || listening ? col : 'rgba(255,255,255,0.18)';
+        c.stroke();
+        c.restore();
+        drawText(c, ACTION_LABELS[a], r.x + 16, r.y + r.h / 2, { size: 18, align: 'left', weight: 'normal', color: '#e8e0ff' });
+        const label = listening ? (Math.floor(Game.time / 20) % 2 ? 'Press any key...' : '') : keyName(CONTROLS[p][a]);
+        drawText(c, label, r.x + r.w - 16, r.y + r.h / 2, { size: 19, align: 'right', color: listening ? '#ffffff' : (p === 0 ? '#ffd3d3' : '#d3e6ff') });
+      });
+      drawButton(c, Object.assign({ label: 'RESET TO DEFAULT', size: 17 }, this.resetRect(p)), this.sel.row === ACTIONS.length && this.sel.col === p);
+    }
+    if (this.from.startsWith('online') && this.msgTimer <= 0) {
+      drawText(c, 'Online matches use your PLAYER 1 controls (left column).', W / 2, 566, { size: 18, color: PLAYER_COLORS[0], stroke: 3 });
+    }
+    if (this.msgTimer > 0) {
+      c.globalAlpha = Math.min(1, this.msgTimer / 30);
+      drawText(c, this.msg, W / 2, 566, { size: 18, color: this.msgWarn ? '#ffb347' : '#7dff9a', stroke: 3 });
+      c.globalAlpha = 1;
+    }
+    drawText(c, 'Up + Attack = up attack   ·   Up + Special = recovery   ·   Down + Attack in the air = down aerial',
+      W / 2, 596, { size: 15, weight: 'normal', color: '#c9bde6' });
+    drawText(c, 'Hold Attack to charge   ·   Tap Shield to dodge (direction = movement keys), hold it to shield   ·   Esc = pause   ·   M = mute',
+      W / 2, 618, { size: 15, weight: 'normal', color: '#c9bde6' });
+    drawButton(c, Object.assign({ label: this.from === 'pause' ? '◀ BACK TO FIGHT' : '◀ BACK', size: 20 }, this.backRect),
+      this.sel.row === ACTIONS.length + 1);
   },
 };
 
@@ -3433,6 +4180,7 @@ const BACK_SLOT = FIGHTER_ORDER.length;
 const backTileRect = () => ({ x: 40, y: 30, w: 130, h: 46 });
 const slotRect = i => ({ x: CS.left + i * (CS.boxW + CS.gap), y: CS.top, w: CS.boxW, h: CS.boxH });
 const readyRect = { x: 340, y: 470, w: 600, h: 90 };
+const controlsTileRect = { x: 1040, y: 30, w: 170, h: 46 };
 
 SCREENS.charSelect = {
   enter() {
@@ -3459,22 +4207,24 @@ SCREENS.charSelect = {
     updateMenuParticles();
     if (Input.wasPressed('Escape')) { this.goBack(); return; }
     const n = FIGHTER_ORDER.length;
+    // keyboard presses from the player's own bindings (mouse buttons are handled below)
+    const key = code => !isMouseCode(code) && Input.wasPressed(code);
     for (let p = 0; p < 2; p++) {
       const k = CONTROLS[p];
       if (this.locked[p]) {
-        if (Input.wasPressed(k.special)) { this.locked[p] = false; this.readyTimer = 0; Sound.play('back'); }
+        if (Input.wasPressed(k.special) || Input.wasPressed(k.shield)) { this.locked[p] = false; this.readyTimer = 0; Sound.play('back'); }
         continue;
       }
       const cur = this.cursor[p];
       if (cur !== BACK_SLOT) {
-        if (Input.wasPressed(k.left)) { this.cursor[p] = (cur - 1 + n) % n; Sound.play('menuMove'); }
-        if (Input.wasPressed(k.right)) { this.cursor[p] = (cur + 1) % n; Sound.play('menuMove'); }
-        if (Input.wasPressed(k.up)) { this.lastCol[p] = this.cursor[p]; this.cursor[p] = BACK_SLOT; Sound.play('menuMove'); }
-      } else if (Input.wasPressed(k.down) || Input.wasPressed(k.left) || Input.wasPressed(k.right)) {
+        if (key(k.left)) { this.cursor[p] = (cur - 1 + n) % n; Sound.play('menuMove'); }
+        if (key(k.right)) { this.cursor[p] = (cur + 1) % n; Sound.play('menuMove'); }
+        if (key(k.up)) { this.lastCol[p] = this.cursor[p]; this.cursor[p] = BACK_SLOT; Sound.play('menuMove'); }
+      } else if (key(k.down) || key(k.left) || key(k.right)) {
         this.cursor[p] = this.lastCol[p]; Sound.play('menuMove');
       }
       if (this.cursor[p] !== BACK_SLOT) this.lastCol[p] = this.cursor[p];
-      if (Input.wasPressed(k.attack)) {
+      if (key(k.attack) || key(k.jump)) {               // lock in with attack or jump
         if (this.cursor[p] === BACK_SLOT) { this.goBack(); return; }
         this.lock(p);
       }
@@ -3482,6 +4232,7 @@ SCREENS.charSelect = {
     // mouse: click a portrait to lock in the first player who hasn't chosen yet
     if (Mouse.clicked) {
       if (pointInRect(Mouse, backTileRect())) { this.goBack(); return; }
+      if (pointInRect(Mouse, controlsTileRect)) { Sound.play('menuSelect'); Game.setScreen('controls', { from: 'charSelect' }); return; }
       for (let i = 0; i < n; i++) {
         if (!pointInRect(Mouse, slotRect(i))) continue;
         const p = !this.locked[0] ? 0 : !this.locked[1] ? 1 : -1;
@@ -3490,7 +4241,8 @@ SCREENS.charSelect = {
     }
     if (this.locked[0] && this.locked[1]) {
       this.readyTimer++;
-      const go = this.readyTimer > 10 && (Input.anyPressed(['Enter', 'NumpadEnter', 'Space', 'KeyF', 'KeyK']) || (Mouse.clicked && pointInRect(Mouse, readyRect)));
+      const go = this.readyTimer > 10 && (Input.anyPressed(['Enter', 'NumpadEnter', 'Space']) ||
+        CONTROLS.some(k => key(k.attack) || key(k.jump)) || (Mouse.clicked && pointInRect(Mouse, readyRect)));
       if (go) {
         Game.sel.p1 = this.hovered(0);
         Game.sel.p2 = this.hovered(1);
@@ -3508,6 +4260,7 @@ SCREENS.charSelect = {
     drawButton(c, Object.assign({ label: '◀ BACK', size: 20 }, br), backHover);
     if (this.cursor[0] === BACK_SLOT) drawText(c, 'P1', br.x + br.w + 18, br.y + 14, { size: 14, color: PLAYER_COLORS[0], stroke: 3 });
     if (this.cursor[1] === BACK_SLOT) drawText(c, 'P2', br.x + br.w + 18, br.y + 34, { size: 14, color: PLAYER_COLORS[1], stroke: 3 });
+    drawButton(c, Object.assign({ label: '⚙ CONTROLS', size: 18 }, controlsTileRect), pointInRect(Mouse, controlsTileRect));
 
     // the grid of portraits
     FIGHTER_ORDER.forEach((id, i) => {
@@ -3543,8 +4296,9 @@ SCREENS.charSelect = {
     // the two preview panels
     for (let p = 0; p < 2; p++) this.drawPanel(c, p, p === 0 ? 30 : 650, 290);
 
-    drawText(c, 'P1: A/D choose · F lock in · G cancel        P2: ←/→ choose · K lock in · L cancel        W / ↑ = Back  ·  Esc = Home',
-      W / 2, 704, { size: 15, weight: 'normal', color: '#b7a8dc' });
+    const hint = p => { const k = CONTROLS[p]; return 'P' + (p + 1) + ': ' + keyName(k.left) + '/' + keyName(k.right) + ' choose · ' + keyName(k.attack) + ' or ' + keyName(k.jump) + ' lock in · ' + keyName(k.special) + ' cancel'; };
+    drawText(c, hint(0) + '      ' + hint(1) + '      ' + keyName(CONTROLS[0].up) + ' / ' + keyName(CONTROLS[1].up) + ' = Back · Esc = Home',
+      W / 2, 704, { size: 14, weight: 'normal', color: '#b7a8dc' });
 
     if (this.locked[0] && this.locked[1]) {           // both ready: big banner
       const r = readyRect;
@@ -3555,7 +4309,7 @@ SCREENS.charSelect = {
       c.fillStyle = g; c.shadowColor = '#fff'; c.shadowBlur = 20 + Math.sin(Game.time * 0.15) * 10; c.fill();
       c.restore();
       drawText(c, 'READY TO FIGHT!', W / 2, r.y + 34, { size: 40, font: TITLE_FONT, weight: 'normal', color: '#fff', stroke: 6, strokeColor: '#2a0f40' });
-      drawText(c, 'Press F / K / Enter (or click) to continue', W / 2, r.y + 70, { size: 18, color: '#fff' });
+      drawText(c, 'Press Enter / Space (or click) to continue', W / 2, r.y + 70, { size: 18, color: '#fff' });
     }
   },
   drawPanel(c, p, x, y) {
@@ -3573,7 +4327,7 @@ SCREENS.charSelect = {
     const t = Game.time + p * 40;
     const pose = this.locked[p] ? POSES.victory(t) : POSES.idle(t);
     drawFighter(c, def, pal, x + 130, y + 340, 1, pose, { scale: 2.3, time: t, auraBoost: this.locked[p] ? 0.15 : 0 });
-    if (this.locked[p] && Game.time % 3 === 0) emitElement(def.element, pal.fx, x + 130 + rand(-60, 60), y + 340 - rand(0, 200), 1, 1.5);
+    if (this.locked[p] && !this.noSparks && Game.time % 3 === 0) emitElement(def.element, pal.fx, x + 130 + rand(-60, 60), y + 340 - rand(0, 200), 1, 1.5);
     // name, element and description
     drawText(c, def.name, x + 260, y + 70, { size: 52, align: 'left', font: TITLE_FONT, weight: 'normal', color: pal.light, stroke: 6, strokeColor: '#140826' });
     c.font = 'bold 16px ' + FONT;
@@ -3645,13 +4399,14 @@ SCREENS.stageSelect = {
     const sf = Game.sel;
     drawText(c, FIGHTERS[sf.p1].name + '  vs  ' + FIGHTERS[sf.p2].name, W / 2, 124, { size: 22, color: '#ffffff' });
     drawButton(c, this.backBtn, this.index === STAGES.length);
-    drawText(c, 'A/D or ←/→ to choose  ·  Enter / F / K or click to fight  ·  Esc = back', W / 2, 700, { size: 16, weight: 'normal', color: '#b7a8dc' });
+    drawText(c, 'A/D or ←/→ to choose  ·  Enter / Space or click to fight  ·  Esc = back', W / 2, 700, { size: 16, weight: 'normal', color: '#b7a8dc' });
   },
 };
 
 // ----------------------------------------------------------------- FIGHT
 SCREENS.fight = {
-  enter() { Game.match = new Match(Game.sel); },
+  // { resume: true } comes back to the paused match (e.g. from the Controls screen)
+  enter(opts) { if (!(opts && opts.resume && Game.match)) Game.match = new Match(Game.sel); },
   update() { Game.match.update(); },
   draw(c) { Game.match.draw(c); },
 };
@@ -3660,6 +4415,14 @@ SCREENS.fight = {
 SCREENS.results = {
   enter() {
     this.t = 0;
+    if (Game.lastResult.online) {
+      this.menu = new Menu([
+        { label: 'BACK TO ROOM', x: 390, y: 630, w: 260, h: 60, action: () => Game.setScreen('onlineLobby') },
+        { label: 'LEAVE ROOM', x: 670, y: 630, w: 220, h: 60, action: () => Net.leave() },
+      ], { horizontal: true });
+      Sound.play('victory');
+      return;
+    }
     this.menu = new Menu([
       { label: 'REMATCH', x: 300, y: 630, w: 220, h: 60, action: () => Game.setScreen('fight') },
       { label: 'CHARACTER SELECT', x: 540, y: 630, w: 280, h: 60, size: 22, action: () => Game.setScreen('charSelect') },
@@ -3699,7 +4462,8 @@ SCREENS.results = {
     if (win) {
       const def = FIGHTERS[win.id];
       drawFighter(c, def, win.palette, 330, 590, 1, POSES.victory(this.t), { scale: 3.1 * 88 / def.height, time: this.t, auraBoost: 0.2 });
-      drawText(c, 'P' + (r.winner + 1) + ' WINS!', 330, 70, { size: 70, font: TITLE_FONT, weight: 'normal', color: PLAYER_COLORS[r.winner], stroke: 8, strokeColor: '#140826' });
+      const who = r.online ? (r.winner === Net.localIndex ? 'YOU WIN!' : 'RIVAL WINS!') : 'P' + (r.winner + 1) + ' WINS!';
+      drawText(c, who, 330, 70, { size: 70, font: TITLE_FONT, weight: 'normal', color: PLAYER_COLORS[r.winner], stroke: 8, strokeColor: '#140826' });
       drawText(c, def.name, 330, 130, { size: 40, font: TITLE_FONT, weight: 'normal', color: win.palette.light, stroke: 6, strokeColor: '#140826' });
     } else {
       drawText(c, 'DRAW!', 330, 300, { size: 90, font: TITLE_FONT, weight: 'normal', color: '#ffffff', stroke: 8, strokeColor: '#140826' });
@@ -3728,7 +4492,633 @@ SCREENS.results = {
 
 
 /* =======================================================================
-   12. MAIN LOOP  - fixed time step
+   12. ONLINE MULTIPLAYER
+   -----------------------------------------------------------------------
+   ROOMS: PeerJS (a small library loaded at the top of the page) connects
+   two browsers directly with WebRTC. The host's "peer ID" is made from
+   the room code, so a friend can find the host just by typing the code.
+   PeerJS's free public server only introduces the two browsers - after
+   that, game messages go straight from one computer to the other.
+
+   LOCKSTEP: both computers run the SAME match code with the SAME button
+   presses, so both games stay identical. Every frame you send your
+   buttons to your rival, and a frame only runs once BOTH players'
+   buttons for it have arrived. To hide the time a message takes to
+   travel, your presses are scheduled a few frames in the future
+   ("input delay", picked from the ping when the match starts).
+
+   The host is always Player 1 (red), the friend who joins is Player 2.
+   Online, both players use their own PLAYER 1 controls.
+   ======================================================================= */
+
+const NET_ROOM_PREFIX = 'elemental-clash-room-';            // + the room code = the host's peer ID
+const NET_VERSION = 1;                                      // both players need the same game version
+const CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';    // no O/0 or I/1 - they look alike
+const CODE_LENGTH = 5;
+const NET_TIMEOUT_MS = 10000;                               // nothing heard for this long = connection lost
+const NET_CONNECT_TIMEOUT_MS = 15000;                       // give up joining after this long
+
+function makeRoomCode() {
+  let code = '';
+  for (let i = 0; i < CODE_LENGTH; i++) code += CODE_LETTERS[Math.floor(Math.random() * CODE_LETTERS.length)];
+  return code;
+}
+
+// Your buttons are packed into ONE number to send over the network:
+// bits 0-7 = held (one bit per action in ACTIONS), bits 8-15 = pressed this frame.
+function readLocalBits() {
+  const k = CONTROLS[0];
+  let bits = 0;
+  ACTIONS.forEach((a, i) => {
+    if (Input.isDown(k[a])) bits |= 1 << i;
+    if (Input.wasPressed(k[a])) bits |= 1 << (i + 8);
+  });
+  return bits;
+}
+// ...and unpacked into the same kind of object readPlayerInput() makes.
+function decodeInput(bits) {
+  const inp = {};
+  ACTIONS.forEach((a, i) => {
+    inp[a] = (bits & (1 << i)) !== 0;
+    inp[a + 'P'] = (bits & (1 << (i + 8))) !== 0;
+  });
+  return inp;
+}
+
+const Net = {
+  peer: null, conn: null,
+  isHost: false,
+  code: '',
+  peerOpen: false,          // true once the room exists on the PeerJS server
+  connected: false,         // true once the two players are linked
+  status: '',               // message shown on the create/join screens
+  connectStart: 0, lastHeard: 0, timer: null,
+  rtt: 0,                   // ping: time for a message to go there and back (ms)
+  rttSamples: [],           // the last few pings, to pick a safe input delay
+  me: { fighter: 'pyro', ready: false },
+  them: { fighter: 'tide', ready: false },
+  stage: 0,
+  // lockstep state (see tick)
+  matchId: 0, delay: 3, simFrame: 0, sendFrame: 0,
+  localInputs: {}, remoteInputs: {}, remoteMax: 0,
+  latch: 0, stall: 0, sums: {}, desync: false, menuOpen: false,
+
+  get localIndex() { return this.isHost ? 0 : 1; },
+  available() { return typeof Peer !== 'undefined'; },
+
+  // ------------------------------------------------ CREATE / JOIN A ROOM
+  host() {
+    this.shutdown();
+    this.isHost = true;
+    this.code = makeRoomCode();
+    this.status = 'Creating room...';
+    const peer = this.peer = new Peer(NET_ROOM_PREFIX + this.code);
+    peer.on('open', () => { if (peer === this.peer) { this.peerOpen = true; this.status = 'Waiting for your friend to join...'; } });
+    peer.on('connection', conn => {
+      if (peer !== this.peer) return;
+      if (this.conn) { conn.on('open', () => conn.close()); return; }   // room is full
+      this.setupConnection(conn);
+    });
+    peer.on('error', err => { if (peer === this.peer) this.onPeerError(err); });
+  },
+
+  join(code) {
+    this.shutdown();
+    this.isHost = false;
+    this.code = code;
+    this.status = 'Connecting to room ' + code + '...';
+    this.connectStart = performance.now();
+    const peer = this.peer = new Peer();
+    peer.on('open', () => {
+      if (peer !== this.peer) return;
+      this.peerOpen = true;
+      this.setupConnection(peer.connect(NET_ROOM_PREFIX + code, { reliable: true, serialization: 'json' }));
+    });
+    peer.on('error', err => { if (peer === this.peer) this.onPeerError(err); });
+    this.startTimer();
+  },
+
+  setupConnection(conn) {
+    this.conn = conn;
+    conn.on('open', () => {
+      if (conn !== this.conn) return;
+      this.connected = true;
+      this.lastHeard = performance.now();
+      this.me.ready = this.them.ready = false;
+      this.rttSamples = [];
+      this.send({ t: 'hello', v: NET_VERSION });
+      this.send({ t: 'ping', ts: performance.now() });   // measure the ping straight away
+      this.startTimer();
+      Sound.play('lock');
+      Game.setScreen('onlineLobby');
+    });
+    conn.on('data', msg => { if (conn === this.conn) this.receive(msg); });
+    conn.on('close', () => { if (conn === this.conn) this.lost('Your rival left the room.'); });
+    conn.on('error', () => { if (conn === this.conn) this.lost('The connection to your rival broke.'); });
+  },
+
+  onPeerError(err) {
+    if (err.type === 'unavailable-id' && this.isHost && !this.connected) { this.host(); return; }   // code taken: pick another
+    if (this.connected) return;      // we already talk directly, so a server hiccup doesn't matter now
+    const messages = {
+      'peer-unavailable': 'No room with that code. Check it and try again.',
+      'network': "Can't reach the online server. Check your internet connection.",
+      'server-error': "Can't reach the online server. Try again in a moment.",
+      'socket-error': "Can't reach the online server. Check your internet connection.",
+      'socket-closed': 'Lost contact with the online server.',
+      'browser-incompatible': 'This browser does not support online play. Try Chrome, Edge or Firefox.',
+    };
+    this.fail(messages[err.type] || 'Connection error (' + err.type + ').');
+  },
+
+  // Pings once a second, and notices when the other side has gone quiet.
+  // (A timer, not the game loop, so it keeps running if this tab is in the background.)
+  startTimer() {
+    if (this.timer) return;
+    this.timer = setInterval(() => {
+      const now = performance.now();
+      if (this.connected) {
+        this.send({ t: 'ping', ts: now });
+        if (now - this.lastHeard > NET_TIMEOUT_MS) this.lost('Lost the connection to your rival.');
+      } else if (!this.isHost && this.peer && now - this.connectStart > NET_CONNECT_TIMEOUT_MS) {
+        this.fail("Couldn't connect to that room. Check the code and try again.");
+      }
+    }, 1000);
+  },
+
+  send(msg) {
+    if (this.conn && this.conn.open) {
+      try { this.conn.send(msg); } catch (err) { /* the connection is closing */ }
+    }
+  },
+
+  // Close everything and forget the room.
+  shutdown() {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    const conn = this.conn, peer = this.peer;
+    this.conn = null; this.peer = null;               // set first, so their 'close' events are ignored
+    this.connected = false; this.peerOpen = false;
+    this.me.ready = this.them.ready = false;
+    this.menuOpen = false;
+    try { if (conn) conn.close(); } catch (err) { /* already closed */ }
+    try { if (peer) peer.destroy(); } catch (err) { /* already gone */ }
+  },
+  // Couldn't create or join: stay on the same screen and say why.
+  fail(message) { this.shutdown(); this.status = message; Sound.play('back'); },
+  // Lost the rival after connecting: back to the online menu.
+  lost(message) {
+    if (!this.peer) return;
+    this.shutdown();
+    Game.setScreen('online');
+    Game.toast(message);
+    Sound.play('back');
+  },
+  // We chose to leave.
+  leave() {
+    this.send({ t: 'bye' });
+    this.shutdown();
+    Game.setScreen('online');
+  },
+
+  // ------------------------------------------------------- MESSAGES
+  receive(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    this.lastHeard = performance.now();
+    switch (msg.t) {
+      case 'hello':
+        if (msg.v !== NET_VERSION) { this.lost('Your rival has a different version of the game. Both refresh the page.'); return; }
+        this.sendLobby();
+        break;
+      case 'lobby':                                   // the rival changed fighter / readiness (host: also stage)
+        if (FIGHTERS[msg.fighter]) this.them.fighter = msg.fighter;
+        this.them.ready = !!msg.ready;
+        if (!this.isHost && STAGES[msg.stage]) this.stage = msg.stage;
+        this.tryStart();
+        break;
+      case 'start': if (!this.isHost) this.beginMatch(msg); break;
+      case 'in':                                      // the rival's buttons for frame msg.f
+        if (msg.m !== this.matchId) return;
+        this.remoteInputs[msg.f] = msg.b;
+        this.remoteMax = Math.max(this.remoteMax, msg.f);
+        break;
+      case 'sum': if (msg.m === this.matchId) this.recordSum(msg.f, msg.s, 'theirs'); break;
+      case 'ping': this.send({ t: 'pong', ts: msg.ts }); break;
+      case 'pong':
+        this.rtt = performance.now() - msg.ts;
+        this.rttSamples.push(this.rtt);
+        if (this.rttSamples.length > 5) this.rttSamples.shift();
+        break;
+      case 'bye': this.lost('Your rival left the room.'); break;
+    }
+  },
+
+  // ---------------------------------------------------------- LOBBY
+  sendLobby() { this.send({ t: 'lobby', fighter: this.me.fighter, ready: this.me.ready, stage: this.stage }); },
+  setReady(ready) {
+    if (this.me.ready === ready) return;
+    this.me.ready = ready;
+    this.sendLobby();
+    this.tryStart();
+  },
+  // The host starts the match as soon as both players are ready.
+  tryStart() {
+    if (!this.isHost || !this.connected || !this.me.ready || !this.them.ready || Game.screen !== 'onlineLobby') return;
+    // Input delay: enough frames to cover a one-way trip on the WORST recent ping
+    // (+20 ms for wobble, +1 frame for safety). Too small and the game stutters
+    // while it waits for the rival's buttons; too big and your moves feel slow.
+    const worst = Math.max(this.rtt, ...this.rttSamples);
+    const delay = clamp(Math.ceil((worst / 2 + 20) / STEP) + 1, 2, 10);
+    const msg = { t: 'start', m: this.matchId + 1, p1: this.me.fighter, p2: this.them.fighter, stage: this.stage, delay };
+    this.send(msg);
+    this.beginMatch(msg);
+  },
+  beginMatch(msg) {
+    this.matchId = msg.m;
+    this.delay = msg.delay;
+    this.me.ready = this.them.ready = false;
+    Game.sel = { p1: msg.p1, p2: msg.p2, stage: msg.stage };
+    // the first "delay" frames have no buttons pressed on either side
+    this.localInputs = {}; this.remoteInputs = {};
+    for (let f = 0; f < this.delay; f++) this.localInputs[f] = this.remoteInputs[f] = 0;
+    this.simFrame = 0; this.sendFrame = this.delay; this.remoteMax = this.delay - 1;
+    this.latch = 0; this.stall = 0; this.sums = {}; this.desync = false; this.menuOpen = false;
+    Game.setScreen('onlineFight');
+  },
+
+  // ------------------------------------------------------- LOCKSTEP
+  // Called once per game update while an online match is on screen.
+  tick() {
+    const match = Game.match;
+    // remember presses until they are sent, so a quick tap is never lost
+    if (!this.menuOpen) this.latch |= readLocalBits() & 0xff00;
+    for (let step = 0; step < 2; step++) {
+      // 1. send my buttons for a frame that is "delay" frames in the future
+      if (this.sendFrame <= this.simFrame + this.delay) {
+        const bits = this.menuOpen ? 0 : (readLocalBits() & 0xff) | this.latch;
+        this.latch = 0;
+        this.localInputs[this.sendFrame] = bits;
+        this.send({ t: 'in', m: this.matchId, f: this.sendFrame, b: bits });
+        this.sendFrame++;
+      }
+      // 2. run the next frame - but only once BOTH players' buttons for it are here
+      const f = this.simFrame, mine = this.localInputs[f], theirs = this.remoteInputs[f];
+      if (mine === undefined || theirs === undefined) { this.stall++; return; }
+      this.stall = 0;
+      const p1 = this.isHost ? mine : theirs, p2 = this.isHost ? theirs : mine;
+      match.inputs = [decodeInput(p1), decodeInput(p2)];
+      match.update();
+      delete this.localInputs[f]; delete this.remoteInputs[f];
+      this.simFrame++;
+      if (this.simFrame % 60 === 0) this.sendChecksum(match);
+      if (Game.screen !== 'onlineFight') return;     // the match just ended
+      // 3. only run a second frame if we have fallen behind the rival
+      if (this.remoteMax - this.simFrame <= this.delay) return;
+    }
+  },
+
+  // Once a second both games compare a summary of the fighters. They should
+  // always match; if not, something made the two games drift apart.
+  sendChecksum(match) {
+    const s = match.fighters.map(f => [f.x, f.y, f.vx, f.vy, f.percent, f.stocks, f.state].join(',')).join('|');
+    this.send({ t: 'sum', m: this.matchId, f: this.simFrame, s });
+    this.recordSum(this.simFrame, s, 'mine');
+  },
+  recordSum(frame, s, whose) {
+    const entry = this.sums[frame] || (this.sums[frame] = {});
+    entry[whose] = s;
+    if (entry.mine === undefined || entry.theirs === undefined) return;
+    if (entry.mine !== entry.theirs && !this.desync) {
+      this.desync = true;
+      console.warn('Online match out of sync at frame ' + frame, entry);
+    }
+    delete this.sums[frame];
+  },
+};
+
+// Pasting a room code (Ctrl+V) on the Join screen.
+window.addEventListener('paste', e => {
+  if (Game.screen !== 'onlineJoin' || !e.clipboardData) return;
+  SCREENS.onlineJoin.paste(e.clipboardData.getData('text'));
+  e.preventDefault();
+});
+
+// ---------------------------------------------------------- ONLINE MENU
+SCREENS.online = {
+  enter() {
+    Net.shutdown();                                   // leaving any old room
+    this.menu = new Menu([
+      { label: 'CREATE ROOM', x: 490, y: 260, w: 300, h: 60, size: 26, action: () => Game.setScreen('onlineHost') },
+      { label: 'JOIN ROOM', x: 490, y: 332, w: 300, h: 60, size: 26, action: () => Game.setScreen('onlineJoin') },
+      { label: 'CONTROLS', x: 490, y: 404, w: 300, h: 60, size: 26, action: () => Game.setScreen('controls', { from: 'online' }) },
+      { label: '◀ BACK', x: 490, y: 476, w: 300, h: 60, size: 24, action: () => Game.setScreen('home') },
+    ]);
+  },
+  update() {
+    updateMenuParticles();
+    if (menuPressed('back')) { Sound.play('back'); Game.setScreen('home'); return; }
+    this.menu.update();
+  },
+  draw(c) {
+    drawMenuBackground(c);
+    drawText(c, 'PLAY ONLINE', W / 2, 110, { size: 72, font: TITLE_FONT, weight: 'normal', color: '#ffe27a', stroke: 8, strokeColor: '#2a0f40' });
+    drawText(c, 'One player creates a room and gets a code. The other joins by typing that code.', W / 2, 190, { size: 20, weight: 'normal', color: '#d8c8ff' });
+    this.menu.draw(c);
+    if (!Net.available()) {
+      drawText(c, 'Online play needs an internet connection (the online library could not load).', W / 2, 580, { size: 18, color: '#ffb347' });
+    } else {
+      drawText(c, 'Online, you play with your PLAYER 1 controls (left click = attack by default).', W / 2, 580, { size: 17, weight: 'normal', color: '#b7a8dc' });
+    }
+  },
+};
+
+// ---------------------------------------------------------- CREATE ROOM
+SCREENS.onlineHost = {
+  enter() {
+    if (Net.available()) Net.host();
+    else Net.status = 'Online play needs an internet connection.';
+    this.copyBtn = { label: 'COPY CODE', x: 420, y: 470, w: 210, h: 56 };
+    this.cancelBtn = { label: 'CANCEL', x: 650, y: 470, w: 210, h: 56 };
+  },
+  cancel() { Sound.play('back'); Game.setScreen('online'); },
+  copy() {
+    if (!Net.peerOpen) return;
+    Sound.play('menuSelect');
+    try {
+      navigator.clipboard.writeText(Net.code).then(() => Game.toast('Room code copied!'), () => Game.toast('Could not copy - just tell your friend the code.'));
+    } catch (err) { Game.toast('Could not copy - just tell your friend the code.'); }
+  },
+  update() {
+    updateMenuParticles();
+    if (menuPressed('back')) { this.cancel(); return; }
+    if (Mouse.clicked && pointInRect(Mouse, this.copyBtn)) this.copy();
+    if (Mouse.clicked && pointInRect(Mouse, this.cancelBtn)) this.cancel();
+    if (Input.anyPressed(['KeyC'])) this.copy();
+  },
+  draw(c) {
+    drawMenuBackground(c);
+    drawText(c, 'CREATE ROOM', W / 2, 90, { size: 64, font: TITLE_FONT, weight: 'normal', color: '#ffe27a', stroke: 8, strokeColor: '#2a0f40' });
+    drawText(c, 'YOUR ROOM CODE', W / 2, 180, { size: 22, color: '#d8c8ff' });
+    // one box per letter
+    const bw = 90, gap = 16, left = W / 2 - (CODE_LENGTH * bw + (CODE_LENGTH - 1) * gap) / 2;
+    for (let i = 0; i < CODE_LENGTH; i++) {
+      const x = left + i * (bw + gap);
+      c.save();
+      roundRect(c, x, 210, bw, 110, 14);
+      c.fillStyle = 'rgba(10,6,25,0.85)'; c.fill();
+      c.lineWidth = 3; c.strokeStyle = PLAYER_COLORS[0]; c.stroke();
+      c.restore();
+      const ch = Net.peerOpen ? Net.code[i] : (Math.floor(Game.time / 8) % CODE_LENGTH === i ? '•' : '');
+      drawText(c, ch, x + bw / 2, 268, { size: 72, font: TITLE_FONT, weight: 'normal', color: '#ffffff' });
+    }
+    drawText(c, Net.status, W / 2, 370, { size: 22, color: Net.peer ? '#7dff9a' : '#ffb347' });
+    drawText(c, 'Send this code to your friend. They choose PLAY ONLINE → JOIN ROOM and type it in.', W / 2, 412, { size: 18, weight: 'normal', color: '#d8c8ff' });
+    drawButton(c, this.copyBtn, pointInRect(Mouse, this.copyBtn));
+    drawButton(c, this.cancelBtn, pointInRect(Mouse, this.cancelBtn));
+    drawText(c, 'C = copy code  ·  Esc = cancel  ·  You will be Player 1 (red)', W / 2, 560, { size: 16, weight: 'normal', color: '#b7a8dc' });
+  },
+};
+
+// ------------------------------------------------------------ JOIN ROOM
+SCREENS.onlineJoin = {
+  enter() {
+    this.text = '';
+    Net.status = '';
+    this.joinBtn = { label: 'JOIN', x: 420, y: 430, w: 210, h: 56 };
+    this.cancelBtn = { label: 'CANCEL', x: 650, y: 430, w: 210, h: 56 };
+  },
+  connecting() { return Net.peer !== null; },
+  paste(str) {
+    if (this.connecting()) return;
+    this.text = String(str).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(-CODE_LENGTH);
+  },
+  join() {
+    if (this.connecting() || this.text.length !== CODE_LENGTH) return;
+    if (!Net.available()) { Net.status = 'Online play needs an internet connection.'; return; }
+    Sound.play('menuSelect');
+    Net.join(this.text);
+  },
+  cancel() { Sound.play('back'); Game.setScreen('online'); },
+  update() {
+    updateMenuParticles();
+    if (Input.wasPressed('Escape')) { this.cancel(); return; }
+    if (Mouse.clicked && pointInRect(Mouse, this.cancelBtn)) { this.cancel(); return; }
+    if (Mouse.clicked && pointInRect(Mouse, this.joinBtn)) this.join();
+    if (this.connecting()) return;
+    // typing the code: letters and numbers only (Ctrl+V is handled by the paste event)
+    const ctrl = Input.isDown('ControlLeft') || Input.isDown('ControlRight') || Input.isDown('MetaLeft') || Input.isDown('MetaRight');
+    for (const code of Object.keys(Input.pressed)) {
+      let ch = '';
+      if (code.startsWith('Key')) ch = code.slice(3);
+      else if (code.startsWith('Digit')) ch = code.slice(5);
+      else if (/^Numpad\d$/.test(code)) ch = code.slice(6);
+      if (ch && !ctrl && this.text.length < CODE_LENGTH) { this.text += ch; Net.status = ''; Sound.play('menuMove'); }
+    }
+    if (Input.wasPressed('Backspace') && this.text) { this.text = this.text.slice(0, -1); Net.status = ''; }
+    if (Input.anyPressed(['Enter', 'NumpadEnter'])) this.join();
+  },
+  draw(c) {
+    drawMenuBackground(c);
+    drawText(c, 'JOIN ROOM', W / 2, 90, { size: 64, font: TITLE_FONT, weight: 'normal', color: '#ffe27a', stroke: 8, strokeColor: '#2a0f40' });
+    drawText(c, 'TYPE YOUR FRIEND\'S ROOM CODE', W / 2, 180, { size: 22, color: '#d8c8ff' });
+    const bw = 90, gap = 16, left = W / 2 - (CODE_LENGTH * bw + (CODE_LENGTH - 1) * gap) / 2;
+    for (let i = 0; i < CODE_LENGTH; i++) {
+      const x = left + i * (bw + gap);
+      const active = i === this.text.length && !this.connecting();
+      c.save();
+      roundRect(c, x, 210, bw, 110, 14);
+      c.fillStyle = 'rgba(10,6,25,0.85)'; c.fill();
+      c.lineWidth = active ? 4 : 3; c.strokeStyle = active ? '#ffffff' : PLAYER_COLORS[1]; c.stroke();
+      c.restore();
+      if (this.text[i]) drawText(c, this.text[i], x + bw / 2, 268, { size: 72, font: TITLE_FONT, weight: 'normal', color: '#ffffff' });
+      else if (active && Math.floor(Game.time / 30) % 2 === 0) { c.fillStyle = '#ffffff'; c.fillRect(x + bw / 2 - 18, 296, 36, 5); }
+    }
+    const statusColor = this.connecting() ? '#7dff9a' : '#ffb347';
+    drawText(c, Net.status || 'Type the 5 letters/numbers, then press Enter.', W / 2, 372, { size: 21, color: Net.status ? statusColor : '#b7a8dc' });
+    drawButton(c, Object.assign({}, this.joinBtn, { label: this.connecting() ? 'JOINING...' : 'JOIN' }),
+      this.text.length === CODE_LENGTH && !this.connecting());
+    drawButton(c, this.cancelBtn, pointInRect(Mouse, this.cancelBtn));
+    drawText(c, 'Backspace = delete  ·  Ctrl+V = paste  ·  Esc = cancel  ·  You will be Player 2 (blue)', W / 2, 520, { size: 16, weight: 'normal', color: '#b7a8dc' });
+  },
+};
+
+// ------------------------------------------------------------ THE ROOM
+// Both players pick a fighter (the host also picks the stage) and press READY.
+// The match starts as soon as both are ready.
+SCREENS.onlineLobby = {
+  noSparks: true,                                     // drawPanel is drawn scaled, so skip its sparkles
+  enter() {
+    if (!Net.connected) { Game.setScreen('online'); return; }
+    this.cursor = Math.max(0, FIGHTER_ORDER.indexOf(Net.me.fighter));
+    Net.me.fighter = FIGHTER_ORDER[this.cursor];
+    Net.me.ready = false;
+    Net.sendLobby();
+    this.leaveBtn = { label: '◀ LEAVE', x: 40, y: 30, w: 150, h: 46, size: 20 };
+    this.readyBtn = { x: 510, y: 492, w: 260, h: 58, size: 26 };
+    this.controlsBtn = { label: '⚙ CONTROLS', x: 510, y: 560, w: 260, h: 44, size: 18 };
+    this.stageArrows = [{ x: 510, y: 456, w: 34, h: 30, d: -1 }, { x: 736, y: 456, w: 34, h: 30, d: 1 }];
+  },
+  // these three let us borrow the character-select preview panel (drawPanel)
+  hovered(p) { return p === Net.localIndex ? Net.me.fighter : Net.them.fighter; },
+  paletteFor(p) {
+    const def = FIGHTERS[this.hovered(p)];
+    return p === 1 && this.hovered(0) === this.hovered(1) ? def.altColors : def.colors;
+  },
+  get locked() { return Net.isHost ? [Net.me.ready, Net.them.ready] : [Net.them.ready, Net.me.ready]; },
+  drawPanel: SCREENS.charSelect.drawPanel,
+
+  pick(i) {
+    if (Net.me.ready) return;
+    this.cursor = i;
+    Net.me.fighter = FIGHTER_ORDER[i];
+    Sound.play('menuMove');
+    Net.sendLobby();
+  },
+  changeStage(d) {
+    if (!Net.isHost || STAGES.length < 2) return;
+    Net.stage = (Net.stage + d + STAGES.length) % STAGES.length;
+    Sound.play('menuMove');
+    Net.sendLobby();
+  },
+  toggleReady() {
+    Sound.play(Net.me.ready ? 'back' : 'lock');
+    if (!Net.me.ready) {
+      const def = FIGHTERS[Net.me.fighter], r = slotRect(this.cursor);
+      emitElement(def.element, def.colors.fx, r.x + r.w / 2, r.y + r.h / 2, 40, 7);
+    }
+    Net.setReady(!Net.me.ready);
+  },
+  update() {
+    updateMenuParticles();
+    if (Input.wasPressed('Escape')) { Sound.play('back'); Net.leave(); return; }
+    const k = CONTROLS[0], n = FIGHTER_ORDER.length;
+    const key = code => !isMouseCode(code) && Input.wasPressed(code);
+    if (!Net.me.ready) {
+      if (key(k.left)) this.pick((this.cursor - 1 + n) % n);
+      if (key(k.right)) this.pick((this.cursor + 1) % n);
+      if (key(k.up)) this.changeStage(-1);
+      if (key(k.down)) this.changeStage(1);
+      if (key(k.attack) || key(k.jump) || Input.anyPressed(['Enter', 'NumpadEnter'])) this.toggleReady();
+    } else if (key(k.special) || key(k.shield) || Input.wasPressed('Backspace')) this.toggleReady();
+    if (!Mouse.clicked) return;
+    if (pointInRect(Mouse, this.leaveBtn)) { Sound.play('back'); Net.leave(); return; }
+    if (pointInRect(Mouse, this.controlsBtn)) { Sound.play('menuSelect'); Game.setScreen('controls', { from: 'onlineLobby' }); return; }
+    if (pointInRect(Mouse, this.readyBtn)) { this.toggleReady(); return; }
+    for (const a of this.stageArrows) if (pointInRect(Mouse, a)) this.changeStage(a.d);
+    for (let i = 0; i < n; i++) if (pointInRect(Mouse, slotRect(i))) this.pick(i);
+  },
+  draw(c) {
+    drawMenuBackground(c);
+    const me = Net.localIndex, them = 1 - me;
+    drawText(c, 'ONLINE ROOM', W / 2, 52, { size: 52, font: TITLE_FONT, weight: 'normal', color: '#ffe27a', stroke: 8, strokeColor: '#2a0f40' });
+    drawButton(c, this.leaveBtn, pointInRect(Mouse, this.leaveBtn));
+    // room code and ping, top right
+    c.save();
+    roundRect(c, 1000, 24, 205, 58, 12); c.fillStyle = 'rgba(10,6,25,0.85)'; c.fill();
+    c.strokeStyle = 'rgba(255,255,255,0.3)'; c.lineWidth = 2; c.stroke();
+    c.restore();
+    drawText(c, 'ROOM  ' + Net.code, 1102, 44, { size: 20, color: '#ffffff' });
+    drawText(c, 'ping ' + Math.round(Net.rtt) + ' ms', 1102, 68, { size: 14, weight: 'normal', color: Net.rtt < 120 ? '#7dff9a' : '#ffb347' });
+
+    // fighter portraits, with a frame for you and one for your rival
+    FIGHTER_ORDER.forEach((id, i) => {
+      const r = slotRect(i), def = FIGHTERS[id];
+      drawPortrait(c, id, def.colors, r.x, r.y, r.w, r.h, Game.time + i * 17);
+      c.save(); roundRect(c, r.x, r.y, r.w, r.h, 12);
+      c.lineWidth = 2; c.strokeStyle = pointInRect(Mouse, r) && !Net.me.ready ? '#ffffff' : 'rgba(255,255,255,0.3)'; c.stroke();
+      c.restore();
+      c.fillStyle = 'rgba(0,0,0,0.6)'; c.fillRect(r.x + 4, r.y + r.h - 30, r.w - 8, 26);
+      drawText(c, def.name, r.x + r.w / 2, r.y + r.h - 17, { size: 18, color: def.colors.light });
+    });
+    for (const p of [them, me]) {
+      const r = slotRect(FIGHTER_ORDER.indexOf(this.hovered(p))), inset = p === 0 ? -6 : 3, col = PLAYER_COLORS[p];
+      c.save();
+      roundRect(c, r.x + inset, r.y + inset, r.w - inset * 2, r.h - inset * 2, 14);
+      c.lineWidth = 5; c.strokeStyle = col; c.shadowColor = col; c.shadowBlur = 14 + Math.sin(Game.time * 0.2) * 6;
+      c.stroke(); c.restore();
+      const tagX = p === 0 ? r.x + 4 : r.x + r.w - 54;
+      roundRect(c, tagX, r.y - 16, 50, 24, 6); c.fillStyle = col; c.fill();
+      drawText(c, p === me ? 'YOU' : 'RIVAL', tagX + 25, r.y - 4, { size: 13, color: '#fff' });
+    }
+
+    // the two preview panels (75% size)
+    for (const p of [0, 1]) {
+      const x = p === 0 ? 30 : 800, y = 280;
+      c.save(); c.translate(x, y); c.scale(0.75, 0.75);
+      this.drawPanel(c, p, 0, 0);
+      c.restore();
+      drawText(c, p === me ? 'YOU' : 'RIVAL', x + 225, y - 2, { size: 18, color: PLAYER_COLORS[p], stroke: 4 });
+    }
+
+    // stage (the host chooses)
+    const stage = STAGES[Net.stage] || STAGES[0];
+    drawText(c, Net.isHost ? 'STAGE (you choose)' : 'STAGE (host chooses)', W / 2, 296, { size: 15, color: '#b7a8dc' });
+    renderStageView(c, stage, 510, 310, 260, 140, Game.time);
+    c.save(); roundRect(c, 508, 308, 264, 144, 10); c.strokeStyle = 'rgba(255,255,255,0.4)'; c.lineWidth = 2; c.stroke(); c.restore();
+    drawText(c, stage.name, W / 2, 471, { size: 18, color: '#ffe27a' });
+    if (Net.isHost && STAGES.length > 1) {
+      for (const a of this.stageArrows) drawButton(c, Object.assign({ label: a.d < 0 ? '◀' : '▶', size: 16 }, a), pointInRect(Mouse, a));
+    }
+
+    // ready + controls
+    const ready = Net.me.ready;
+    drawButton(c, Object.assign({ label: ready ? 'CANCEL READY' : 'READY!' }, this.readyBtn, { size: ready ? 20 : 26 }),
+      !ready && Math.floor(Game.time / 30) % 2 === 0 || pointInRect(Mouse, this.readyBtn));
+    drawButton(c, this.controlsBtn, pointInRect(Mouse, this.controlsBtn));
+
+    const status = !Net.me.ready ? 'Pick your fighter, then press READY.'
+      : !Net.them.ready ? 'Waiting for your rival to get ready...' : 'Starting!';
+    drawText(c, status, W / 2, 636, { size: 22, color: Net.me.ready ? '#7dff9a' : '#ffffff', stroke: 4 });
+    const k = CONTROLS[0];
+    drawText(c, keyName(k.left) + '/' + keyName(k.right) + ' or click = choose  ·  ' + keyName(k.attack) + ' / ' + keyName(k.jump) +
+      ' / Enter = ready  ·  ' + keyName(k.special) + ' = cancel  ·  Esc = leave room', W / 2, 700, { size: 14, weight: 'normal', color: '#b7a8dc' });
+  },
+};
+
+// ---------------------------------------------------------- ONLINE FIGHT
+// The match runs through Net.tick() (lockstep). It can't pause, so Esc
+// opens a small menu while the fight keeps going behind it.
+SCREENS.onlineFight = {
+  enter() {
+    Game.match = new Match(Game.sel, { online: true, localIndex: Net.localIndex });
+    this.menu = new Menu([
+      { label: 'KEEP FIGHTING', x: 470, y: 300, w: 340, h: 56, action: () => { Net.menuOpen = false; } },
+      { label: 'LEAVE MATCH', x: 470, y: 370, w: 340, h: 56, action: () => Net.leave() },
+    ]);
+  },
+  update() {
+    if (Input.wasPressed('Escape') && Game.match.phase !== 'ending') {
+      Net.menuOpen = !Net.menuOpen;
+      this.menu.index = 0;
+      Sound.play('pause');
+    } else if (Net.menuOpen) this.menu.update();
+    if (Game.screen !== 'onlineFight') return;        // we left the match from the menu
+    Net.tick();
+  },
+  draw(c) {
+    Game.match.draw(c);
+    drawText(c, 'ping ' + Math.round(Net.rtt) + ' ms', 12, 20, { size: 14, align: 'left', weight: 'normal', color: '#ffffff', stroke: 3 });
+    if (Net.desync) {
+      drawText(c, 'Out of sync! Your screens may not match - try a rematch (both using the same browser helps).', W / 2, 20,
+        { size: 15, color: '#ffb347', stroke: 3 });
+    }
+    if (Net.stall > 20) {                            // nothing from the rival for a moment
+      c.fillStyle = 'rgba(5,3,15,0.45)'; c.fillRect(0, H / 2 - 40, W, 80);
+      drawText(c, 'Waiting for your rival' + '...'.slice(0, 1 + Math.floor(Game.time / 20) % 3), W / 2, H / 2,
+        { size: 34, font: TITLE_FONT, weight: 'normal', color: '#ffffff', stroke: 6, strokeColor: '#2a0f40' });
+    }
+    if (Net.menuOpen) {
+      c.fillStyle = 'rgba(5,3,15,0.7)'; c.fillRect(0, 0, W, H);
+      drawText(c, 'MENU', W / 2, 200, { size: 70, font: TITLE_FONT, weight: 'normal', color: '#ffe27a', stroke: 8, strokeColor: '#2a0f40' });
+      drawText(c, 'Online matches can\'t be paused - the fight keeps going while this is open!', W / 2, 256, { size: 18, color: '#ffb347' });
+      this.menu.draw(c);
+      drawText(c, 'Esc = back to the fight', W / 2, 460, { size: 16, weight: 'normal', color: '#c9bde6' });
+    }
+  },
+};
+
+
+/* =======================================================================
+   13. MAIN LOOP  - fixed time step
    -----------------------------------------------------------------------
    The browser calls frame() about 60 times a second (or more on fast
    monitors). We add up the real time that passed and run update() once
@@ -3738,10 +5128,15 @@ SCREENS.results = {
 
 function update() {
   Game.time++;
-  if (Input.wasPressed('Backquote')) DEBUG = !DEBUG;
-  if (Input.wasPressed('KeyM')) Sound.toggleMute();
-  if (Mouse.clicked && pointInRect(Mouse, MUTE_BUTTON)) { Sound.toggleMute(); Mouse.clicked = false; }
+  // global hotkeys (skipped while rebinding, or if a player bound that key)
+  const rebinding = (Game.screen === 'controls' && SCREENS.controls.listening) || Game.screen === 'onlineJoin';
+  if (!rebinding) {
+    if (Input.wasPressed('Backquote') && !isBound('Backquote')) DEBUG = !DEBUG;
+    if (Input.wasPressed('KeyM') && !isBound('KeyM')) Sound.toggleMute();
+    if (Mouse.clicked && pointInRect(Mouse, MUTE_BUTTON)) { Sound.toggleMute(); Mouse.clicked = false; delete Input.pressed.Mouse0; }
+  }
   SCREENS[Game.screen].update();
+  if (Game.toastTimer > 0) Game.toastTimer--;
   Input.endFrame();
   Mouse.clicked = false;
   Mouse.moved = false;
@@ -3754,6 +5149,16 @@ function render() {
   ctx.globalCompositeOperation = 'source-over';
   SCREENS[Game.screen].draw(ctx);
   drawMuteButton(ctx);
+  if (Game.toastTimer > 0) {                       // toast message at the bottom
+    ctx.globalAlpha = Math.min(1, Game.toastTimer / 30);
+    ctx.font = 'bold 20px ' + FONT;
+    const tw = ctx.measureText(Game.toastText).width + 48;
+    roundRect(ctx, W / 2 - tw / 2, 640, tw, 44, 22);
+    ctx.fillStyle = 'rgba(12,8,28,0.92)'; ctx.fill();
+    ctx.strokeStyle = '#ffb347'; ctx.lineWidth = 2; ctx.stroke();
+    drawText(ctx, Game.toastText, W / 2, 663, { size: 20, color: '#ffe27a' });
+    ctx.globalAlpha = 1;
+  }
   if (DEBUG) drawText(ctx, 'DEBUG  ·  ' + fps + ' FPS  ·  particles: ' + particles.length, 12, 20, { size: 14, align: 'left', color: '#7dff9a', stroke: 3 });
 }
 

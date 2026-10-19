@@ -1,13 +1,23 @@
 # Elemental Clash
 
-A 2-player local platform fighter that runs in your browser. Five elemental fighters, one floating shrine, three stocks each. The higher your damage %, the farther you fly — knock your rival past the edge of the screen to take a stock.
+A 2-player platform fighter that runs in your browser — on one keyboard, or **online with a room code**. Five elemental fighters, one floating shrine, three stocks each. The higher your damage %, the farther you fly — knock your rival past the edge of the screen to take a stock.
 
-Everything — characters, stage, effects and sound — is drawn and synthesized with code. No images, no audio files, no libraries. Just one HTML file.
+Everything — characters, stage, effects and sound — is drawn and synthesized with code. No images, no audio files. Just one HTML file (online play loads one small library, [PeerJS](https://peerjs.com/), to connect the two browsers).
 
 ## Play
 
 - **Online:** https://liamtanaka-max.github.io/elemental-clash/ (once GitHub Pages is enabled: Settings → Pages → Deploy from branch `main`, folder `/ (root)`)
 - **Locally:** download `index.html` and double-click it.
+
+## Online play
+
+1. One player chooses **PLAY ONLINE → CREATE ROOM** and gets a 5-letter room code.
+2. They send the code to a friend, who chooses **PLAY ONLINE → JOIN ROOM** and types it in (Ctrl+V pastes).
+3. In the room, both pick a fighter (the host picks the stage) and press **READY**. The match starts when both are ready.
+
+The host is Player 1 (red) and the friend is Player 2 (blue). Online, **each player uses their own Player 1 controls**, which can be changed from the room's ⚙ CONTROLS button before the fight. Online matches can't be paused: `Esc` opens a menu while the fight keeps going.
+
+How it works: the two browsers connect directly with WebRTC (PeerJS's free server only introduces them). Both computers run the same match with the same button presses ("lockstep"). Your presses are delayed by a few frames, picked from the ping, so the rival's buttons arrive in time. Both players need an internet connection and should use the same version of the page.
 
 ## Fighters
 
@@ -21,15 +31,16 @@ Everything — characters, stage, effects and sound — is drawn and synthesized
 
 ## Controls
 
-| Action | Player 1 | Player 2 |
+| Action | Player 1 (and online) | Player 2 |
 |---|---|---|
 | Move | A / D | ← / → |
-| Jump / double jump | W | ↑ |
-| Crouch / fast-fall / drop through | S | ↓ |
-| Attack | F | K |
-| Special | G | L |
-| Shield (hold) | H | ; |
-| Dodge | H + direction | ; + direction |
+| Up / Down (aim, crouch, fast-fall, drop through) | W / S | ↑ / ↓ |
+| Jump / double jump | Space | Enter |
+| Attack (hold to charge) | **Left Click** | . |
+| Special | Right Click | / |
+| Shield (hold) / Dodge (tap) | Left Shift | Right Shift |
+
+Every key can be changed on the **CONTROLS** screen (from the home menu, the ⚙ CONTROLS button on character select or in an online room, or the pause menu). Bindings are saved in your browser.
 
 Hold a direction while attacking for tilts and aerials. **Up + Special** is always a recovery. Grab ledges to get back on stage.
 
@@ -37,7 +48,7 @@ Hold a direction while attacking for tilts and aerials. **Up + Special** is alwa
 
 ## How the code is organized
 
-`index.html` is split into 12 labeled sections (search for the `=====` headers):
+`index.html` is split into 13 labeled sections (search for the `=====` headers):
 
 1. Setup & helpers
 2. Input
@@ -50,7 +61,8 @@ Hold a direction while attacking for tilts and aerials. **Up + Special** is alwa
 9. Projectiles
 10. Match class (hits, knockback, camera, HUD)
 11. UI & screens
-12. Main loop (fixed 60 FPS time step)
+12. Online multiplayer (rooms, codes, lockstep sync)
+13. Main loop (fixed 60 FPS time step)
 
 Knockback formula:
 
