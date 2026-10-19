@@ -4945,7 +4945,7 @@ function matchChecksum(match) {
 }
 
 const Net = {
-  peer: null, conn: null, inputConn: null,
+  peer: null, conn: null,
   isHost: false,
   code: '',
   peerOpen: false,          // true once the room exists on the PeerJS server
@@ -4970,15 +4970,13 @@ const Net = {
   iceServers: STUN_SERVERS,  // + relay servers, if TURN_CREDENTIALS_URL is set (loaded below)
 
   get localIndex() { return this.isHost ? 0 : 1; },
-  peerOptions() { return { config: { iceServers: this.iceServers } }; },
+  peerOptions() { return { config: { iceServers: this.iceServers, sdpSemantics: 'unified-plan' } }; },
   available() { return typeof Peer !== 'undefined'; },
 
   // ------------------------------------------------ CREATE / JOIN A ROOM
-  // Two connections are opened between the players:
-  //   'control' - lobby messages, in order (reliable)
-  //   'input'   - button presses. Delivered even if a packet is lost, but
-  //               NOT held back waiting for an older lost one, so a hiccup
-  //               doesn't hold up newer button presses.
+  // ONE connection carries everything (lobby messages and button presses),
+  // reliable and in order. (One connection links up more reliably between
+  // different devices and browsers than two.)
   host() {
     this.shutdown();
     this.isHost = true;
@@ -4988,10 +4986,8 @@ const Net = {
     peer.on('open', () => { if (peer === this.peer) { this.peerOpen = true; this.status = 'Waiting for your friend to join...'; } });
     peer.on('connection', conn => {
       if (peer !== this.peer) return;
-      const full = conn.label === 'input' ? (this.inputConn || !this.conn || this.conn.peer !== conn.peer) : this.conn;
-      if (full) { conn.on('open', () => conn.close()); return; }   // room is full
-      if (conn.label === 'input') this.setupInputConnection(conn);
-      else this.setupConnection(conn);
+      if (this.conn && this.connected) { conn.on('open', () => conn.close()); return; }   // room is full
+      this.setupConnection(conn);                     // (a new try replaces one that never linked up)
     });
     peer.on('error', err => { if (peer === this.peer) this.onPeerError(err); });
   },
@@ -5006,7 +5002,8 @@ const Net = {
     peer.on('open', () => {
       if (peer !== this.peer) return;
       this.peerOpen = true;
-      this.setupConnection(peer.connect(NET_ROOM_PREFIX + code, { label: 'control', reliable: true, serialization: 'json' }));
+      this.status = 'Looking for room ' + code + '...';
+      this.setupConnection(peer.connect(NET_ROOM_PREFIX + code, { reliable: true, serialization: 'json' }));
     });
     peer.on('error', err => { if (peer === this.peer) this.onPeerError(err); });
     this.startTimer();
@@ -5022,29 +5019,21 @@ const Net = {
       this.rttSamples = [];
       this.send({ t: 'hello', v: NET_VERSION });
       this.send({ t: 'ping', ts: performance.now() });   // measure the ping straight away
-      // the guest opens the second (button presses) connection once the first one works
-      if (!this.isHost && this.peer) {
-        this.setupInputConnection(this.peer.connect(NET_ROOM_PREFIX + this.code, { label: 'input', reliable: false, serialization: 'json' }));
-      }
       this.startTimer();
       Sound.play('lock');
       Game.setScreen('onlineLobby');
     });
     conn.on('data', msg => { if (conn === this.conn) this.receive(msg); });
-    conn.on('iceStateChanged', state => {           // the two computers couldn't reach each other
-      if (conn === this.conn && !this.connected && state === 'failed') {
-        this.fail(NET_BLOCKED_MSG);
-      }
+    // show how far linking up has got (helps to see where it gets stuck)
+    conn.on('iceStateChanged', state => {
+      if (conn !== this.conn || this.connected) return;
+      if (state === 'failed') { this.fail(NET_BLOCKED_MSG); return; }
+      const steps = { checking: 'Room found - linking up with your friend...', connected: 'Linked! Opening the game channel...',
+        disconnected: 'Link wobbling - still trying...' };
+      if (!this.isHost && steps[state]) this.status = steps[state];
     });
     conn.on('close', () => { if (conn === this.conn) this.lost('Your rival left the room.'); });
     conn.on('error', () => { if (conn === this.conn) this.lost('The connection to your rival broke.'); });
-  },
-  // If the input connection fails, button presses just go through 'control' instead.
-  setupInputConnection(conn) {
-    this.inputConn = conn;
-    conn.on('data', msg => { if (conn === this.inputConn) this.receive(msg); });
-    conn.on('close', () => { if (conn === this.inputConn) this.inputConn = null; });
-    conn.on('error', () => { if (conn === this.inputConn) this.inputConn = null; });
   },
 
   onPeerError(err) {
@@ -5068,7 +5057,7 @@ const Net = {
     this.timer = setInterval(() => {
       const now = performance.now();
       if (this.connected) {
-        this.sendFast({ t: 'ping', ts: now });
+        this.send({ t: 'ping', ts: now });
         if (now - this.lastHeard > NET_TIMEOUT_MS) this.lost('Lost the connection to your rival.');
       } else if (!this.isHost && this.peer && now - this.connectStart > NET_CONNECT_TIMEOUT_MS) {
         this.fail(NET_BLOCKED_MSG);                   // the room exists (else 'peer-unavailable'), but no link
@@ -5081,19 +5070,12 @@ const Net = {
       try { this.conn.send(msg); } catch (err) { /* the connection is closing */ }
     }
   },
-  // Button presses, pings and checksums use the faster 'input' connection when it's open.
-  sendFast(msg) {
-    if (this.inputConn && this.inputConn.open) {
-      try { this.inputConn.send(msg); return; } catch (err) { /* fall back to control */ }
-    }
-    this.send(msg);
-  },
 
   // Close everything and forget the room.
   shutdown() {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
-    const conns = [this.conn, this.inputConn], peer = this.peer;
-    this.conn = null; this.inputConn = null; this.peer = null;   // set first, so their 'close' events are ignored
+    const conns = [this.conn], peer = this.peer;
+    this.conn = null; this.peer = null;               // set first, so their 'close' events are ignored
     this.connected = false; this.peerOpen = false;
     this.me.ready = this.them.ready = false;
     this.menuOpen = false;
@@ -5141,7 +5123,7 @@ const Net = {
         else if (msg.m > this.matchId) (this.early[msg.m] = this.early[msg.m] || []).push(msg);   // arrived before 'start'
         break;
       case 'sum': if (msg.m === this.matchId) this.recordSum(msg.f, msg.s, 'theirs'); break;
-      case 'ping': this.sendFast({ t: 'pong', ts: msg.ts }); break;
+      case 'ping': this.send({ t: 'pong', ts: msg.ts }); break;
       case 'pong':
         this.rtt = performance.now() - msg.ts;
         this.rttSamples.push(this.rtt);
@@ -5243,7 +5225,7 @@ const Net = {
       const s = this.sumAt[this.confirmed];
       if (s !== undefined) {
         delete this.sumAt[this.confirmed];
-        this.sendFast({ t: 'sum', m: this.matchId, f: this.confirmed, s });
+        this.send({ t: 'sum', m: this.matchId, f: this.confirmed, s });
         this.recordSum(this.confirmed, s, 'mine');
       }
     }
@@ -5255,7 +5237,7 @@ const Net = {
       const bits = this.menuOpen ? 0 : (readLocalBits() & HELD_BITS) | this.latch;
       this.latch = 0;
       this.localInputs[this.sendFrame] = bits;
-      this.sendFast({ t: 'in', m: this.matchId, f: this.sendFrame, b: bits, cf: this.frame, ahead: this.frame - this.remoteFrame });
+      this.send({ t: 'in', m: this.matchId, f: this.sendFrame, b: bits, cf: this.frame, ahead: this.frame - this.remoteFrame });
       this.sendFrame++;
     }
   },
