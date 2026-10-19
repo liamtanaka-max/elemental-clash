@@ -4966,7 +4966,7 @@ const Net = {
     peer.on('open', () => { if (peer === this.peer) { this.peerOpen = true; this.status = 'Waiting for your friend to join...'; } });
     peer.on('connection', conn => {
       if (peer !== this.peer) return;
-      const full = conn.label === 'input' ? (this.inputConn || (this.conn && this.conn.peer !== conn.peer)) : this.conn;
+      const full = conn.label === 'input' ? (this.inputConn || !this.conn || this.conn.peer !== conn.peer) : this.conn;
       if (full) { conn.on('open', () => conn.close()); return; }   // room is full
       if (conn.label === 'input') this.setupInputConnection(conn);
       else this.setupConnection(conn);
@@ -4985,7 +4985,6 @@ const Net = {
       if (peer !== this.peer) return;
       this.peerOpen = true;
       this.setupConnection(peer.connect(NET_ROOM_PREFIX + code, { label: 'control', reliable: true, serialization: 'json' }));
-      this.setupInputConnection(peer.connect(NET_ROOM_PREFIX + code, { label: 'input', reliable: false, serialization: 'json' }));
     });
     peer.on('error', err => { if (peer === this.peer) this.onPeerError(err); });
     this.startTimer();
@@ -5001,11 +5000,20 @@ const Net = {
       this.rttSamples = [];
       this.send({ t: 'hello', v: NET_VERSION });
       this.send({ t: 'ping', ts: performance.now() });   // measure the ping straight away
+      // the guest opens the second (button presses) connection once the first one works
+      if (!this.isHost && this.peer) {
+        this.setupInputConnection(this.peer.connect(NET_ROOM_PREFIX + this.code, { label: 'input', reliable: false, serialization: 'json' }));
+      }
       this.startTimer();
       Sound.play('lock');
       Game.setScreen('onlineLobby');
     });
     conn.on('data', msg => { if (conn === this.conn) this.receive(msg); });
+    conn.on('iceStateChanged', state => {           // the two computers couldn't reach each other
+      if (conn === this.conn && !this.connected && state === 'failed') {
+        this.fail("Couldn't connect to your friend's computer. Try again, or try another network.");
+      }
+    });
     conn.on('close', () => { if (conn === this.conn) this.lost('Your rival left the room.'); });
     conn.on('error', () => { if (conn === this.conn) this.lost('The connection to your rival broke.'); });
   },
@@ -5093,7 +5101,10 @@ const Net = {
     this.lastHeard = performance.now();
     switch (msg.t) {
       case 'hello':
-        if (msg.v !== NET_VERSION) { this.lost('Your rival has a different version of the game. Both refresh the page.'); return; }
+        if (msg.v !== NET_VERSION) {
+          this.lost('You and your rival have different versions (you: v' + NET_VERSION + ', rival: v' + (msg.v || 1) + '). Both press Ctrl+F5 to reload.');
+          return;
+        }
         this.sendLobby();
         break;
       case 'lobby':                                   // the rival changed fighter / readiness (host: also stage)
@@ -5293,6 +5304,7 @@ SCREENS.online = {
     drawMenuBackground(c);
     drawText(c, 'PLAY ONLINE', W / 2, 110, { size: 72, font: TITLE_FONT, weight: 'normal', color: '#ffe27a', stroke: 8, strokeColor: '#2a0f40' });
     drawText(c, 'One player creates a room and gets a code. The other joins by typing that code.', W / 2, 190, { size: 20, weight: 'normal', color: '#d8c8ff' });
+    drawText(c, 'Online version ' + NET_VERSION + ' - you and your friend need the same one (Ctrl+F5 reloads).', W / 2, 620, { size: 15, weight: 'normal', color: '#8f80b8' });
     this.menu.draw(c);
     if (!Net.available()) {
       drawText(c, 'Online play needs an internet connection (the online library could not load).', W / 2, 580, { size: 18, color: '#ffb347' });
