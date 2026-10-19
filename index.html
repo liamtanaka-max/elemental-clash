@@ -94,6 +94,9 @@ const PLAYER_COLORS = ['#ff4b4b', '#4b9bff'];   // P1 red, P2 blue
 const FONT = '"Trebuchet MS", "Segoe UI", Verdana, sans-serif';
 const TITLE_FONT = 'Impact, "Arial Black", "Segoe UI Black", sans-serif';
 let DEBUG = false;            // press ` (backtick) to show hitboxes
+// true while online "rollback" quickly re-runs frames that were already shown
+// (see section 12): those frames make no sounds or particles a second time.
+let replaying = false;
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
@@ -193,7 +196,7 @@ function wrapText(c, str, maxWidth) {
 const Input = {
   down: {},
   pressed: {},
-  isDown(code) { return this.down[code] === true; },
+  isDown(code) { return !!code && this.down[code] === true; },
   wasPressed(code) { return this.pressed[code] === true; },
   anyPressed(codes) { return codes.some(c => this.pressed[c] === true); },
   endFrame() { this.pressed = {}; },       // called after every update
@@ -204,14 +207,14 @@ const isMouseCode = code => typeof code === 'string' && code.startsWith('Mouse')
 
 // ----- KEY BINDINGS -----
 // Every action a player can bind. Directions never jump: only "jump" does.
-const ACTIONS = ['left', 'right', 'up', 'down', 'jump', 'attack', 'special', 'shield'];
+const ACTIONS = ['left', 'right', 'up', 'down', 'jump', 'attack', 'special', 'shield', 'grab'];
 const ACTION_LABELS = { left: 'Left', right: 'Right', up: 'Up', down: 'Down', jump: 'Jump',
-  attack: 'Attack', special: 'Special', shield: 'Shield / Dodge' };
+  attack: 'Attack', special: 'Special', shield: 'Shield / Dodge', grab: 'Grab' };
 const DEFAULT_CONTROLS = [
   { left: 'KeyA', right: 'KeyD', up: 'KeyW', down: 'KeyS', jump: 'Space',
-    attack: 'Mouse0', special: 'Mouse2', shield: 'ShiftLeft' },
+    attack: 'Mouse0', special: 'Mouse2', shield: 'ShiftLeft', grab: 'KeyE' },
   { left: 'ArrowLeft', right: 'ArrowRight', up: 'ArrowUp', down: 'ArrowDown', jump: 'Enter',
-    attack: 'Period', special: 'Slash', shield: 'ShiftRight' },
+    attack: 'Period', special: 'Slash', shield: 'ShiftRight', grab: 'Comma' },
 ];
 const CONTROLS_STORAGE_KEY = 'elementalClash.controls.v2';
 
@@ -221,7 +224,15 @@ function loadControls() {
   try {
     const saved = JSON.parse(localStorage.getItem(CONTROLS_STORAGE_KEY));
     if (Array.isArray(saved) && saved.length === 2) {
-      saved.forEach((k, p) => ACTIONS.forEach(a => { if (k && typeof k[a] === 'string' && k[a]) fresh[p][a] = k[a]; }));
+      const added = [];                              // actions that are new since the bindings were saved
+      saved.forEach((k, p) => ACTIONS.forEach(a => {
+        if (k && typeof k[a] === 'string' && k[a]) fresh[p][a] = k[a]; else added.push([p, a]);
+      }));
+      // a new action's default key might already be used by an old binding: leave it unbound then
+      for (const [p, a] of added) {
+        const taken = fresh.some((k, q) => ACTIONS.some(b => (q !== p || b !== a) && k[b] === fresh[p][a]));
+        if (taken) fresh[p][a] = '';
+      }
     }
   } catch (err) { /* no saved bindings: use the defaults */ }
   return fresh;
@@ -295,15 +306,17 @@ function readPlayerInput(k) {
   const d = code => Input.isDown(code), p = code => Input.wasPressed(code);
   return {
     left: d(k.left), right: d(k.right), up: d(k.up), down: d(k.down), jump: d(k.jump),
-    attack: d(k.attack), special: d(k.special), shield: d(k.shield),
+    attack: d(k.attack), special: d(k.special), shield: d(k.shield), grab: d(k.grab),
     leftP: p(k.left), rightP: p(k.right), upP: p(k.up), downP: p(k.down), jumpP: p(k.jump),
-    attackP: p(k.attack), specialP: p(k.special), shieldP: p(k.shield),
+    attackP: p(k.attack), specialP: p(k.special), shieldP: p(k.shield), grabP: p(k.grab),
   };
 }
 // An input object where nothing is pressed (used during the countdown).
 const NO_INPUT = readPlayerInput({});
 // -1 = left, 1 = right, 0 = neither (or both)
 const dirOf = inp => (inp.right ? 1 : 0) - (inp.left ? 1 : 0);
+// Was any button pressed this frame? (used for mashing out of traps and grabs)
+const mashed = inp => ACTIONS.some(a => inp[a + 'P']);
 
 // Menus: arrows/WASD/Enter/Space always work, plus each player's own
 // direction keys and (keyboard) attack key. Mouse clicks are handled by the menus.
@@ -408,7 +421,7 @@ const Sound = {
   // fighter so it can be stopped on release (or when they get hit).
   startCharge(f) {
     this.stopCharge(f);
-    if (!this.ctx || this.muted) return;
+    if (!this.ctx || this.muted || replaying) return;
     const c = this.ctx, t = c.currentTime, dur = TUNING.chargeMaxMs / 1000;
     const osc = c.createOscillator(), g = c.createGain();
     osc.type = 'sawtooth';
@@ -435,7 +448,7 @@ const Sound = {
 
   // All the game's sounds, by name.
   play(name, strength = 1) {
-    if (!this.ctx || this.muted) return;
+    if (!this.ctx || this.muted || replaying) return;
     switch (name) {
       case 'menuMove':   this.tone(520, 0.05, { type: 'square', vol: 0.06 }); break;
       case 'menuSelect': this.tone(660, 0.08, { type: 'square', vol: 0.08 });
@@ -446,6 +459,8 @@ const Sound = {
       case 'jump':       this.tone(280, 0.12, { type: 'triangle', vol: 0.12, slide: 560 }); break;
       case 'djump':      this.tone(400, 0.15, { type: 'triangle', vol: 0.12, slide: 900 }); break;
       case 'land':       this.noise(0.06, { vol: 0.07, freq: 500 }); break;
+      case 'grab':       this.noise(0.08, { vol: 0.18, freq: 700, slide: 200 });
+                         this.tone(200, 0.08, { type: 'triangle', vol: 0.12, slide: 120 }); break;
       case 'swing':      this.noise(0.09, { vol: 0.06 * strength, freq: 2600, slide: 900, type: 'bandpass', q: 2 }); break;
       case 'hit':        this.noise(0.12, { vol: 0.22, freq: 2000, slide: 300 });
                          this.tone(170, 0.1, { type: 'square', vol: 0.1, slide: 60 }); break;
@@ -496,7 +511,7 @@ const particlePool = [];        // dead particles wait here to be reused (no gar
 const MAX_PARTICLES = 1400;     // hard cap so the game stays at 60 FPS
 
 function spawnParticle(o) {
-  if (particles.length >= MAX_PARTICLES) return;   // stay fast: never too many
+  if (replaying || particles.length >= MAX_PARTICLES) return;   // stay fast: never too many
   const p = particlePool.pop() || {};              // recycle an old particle if we have one
   const life = o.life || 30;
   p.x = o.x; p.y = o.y; p.vx = o.vx || 0; p.vy = o.vy || 0; p.life = life; p.maxLife = life;
@@ -1283,7 +1298,7 @@ const FIGHTERS = {
           drawTendril(c, me.x + me.facing * 26, me.y - 58, me.x + me.facing * (26 + 225 * reach), me.y - 58, me.palette, me.animTime);
         } },
       // Not used directly: what happens after the tendril catches someone.
-      sspecialPull: { hidden: true, name: 'Shadow Pull', pose: 'castDown', startup: 16, active: 1, endlag: 22, sfx: 'dark',
+      sspecialPull: { hidden: true, name: 'Shadow Pull', pose: 'castDown', startup: 16, active: 1, endlag: 22, sfx: 'dark', holdsGrab: true,
         pullHit: { dmg: 10, bkb: 6, kbs: 0.21, angle: 40 },
         onFrame(me, f) {
           if (!me.grounded) { me.noGravity = true; me.vy = 0; }
@@ -1339,6 +1354,57 @@ const FIGHTERS = {
     },
   },
 };
+
+// ---------------------------------------------------------------------
+// GRABS & THROWS - every fighter gets these moves (a fighter can define its
+// own "grab", "fthrow"... in its moves to replace them).
+//   Grab button        = grab whoever is right in front of you (goes through shields!)
+//   then a direction   = throw them that way (forward / back / up / down)
+//   Attack (or Grab)   = pummel: a small hit while you keep holding on
+//   The grabbed player mashes any button to break free sooner.
+// ---------------------------------------------------------------------
+function makeThrow(name, pose, hit, back = false) {
+  return { hidden: true, name, pose, startup: 9, active: 1, endlag: 16, noDrift: true, holdsGrab: true,
+    throwHit: hit,
+    onStart(me) { if (back) me.facing = -me.facing; },      // back throw: swing them round behind you
+    onFrame(me, f) {
+      if (f !== 10) return;
+      const t = me.grabbing;
+      me.grabbing = null;
+      if (t && t.state === 'grabbed') {
+        t.grabbedBy = null;
+        me.match.applyHit(me, t, me.move.throwHit, { dir: me.facing });
+        fx(me, 18, 5, 40, -50);
+      }
+    } };
+}
+const COMMON_MOVES = {
+  grab: { name: 'Grab', pose: 'grab', startup: 6, active: 3, endlag: 24,
+    hitboxes: [{ x: 46, y: -50, w: 58, h: 60, dmg: 0, bkb: 0, kbs: 0, angle: 0, effect: 'grab', grabMove: 'grabHold' }] },
+  // Holding someone. Ends with a throw, or lets go when time runs out.
+  grabHold: { hidden: true, name: 'Hold', pose: 'grab', startup: 0, active: 1, endlag: 0, duration: 999,
+    noDrift: true, holdsGrab: true, sfx: 'grab',
+    getPose: (me, f, base) => Object.assign(base, ATTACK_POSES.grab.hit),
+    onFrame(me, f, inp) {
+      const t = me.grabbing, d = me.moveData;
+      if (!t || t.state !== 'grabbed') { me.grabbing = null; me.endMove(); return; }
+      if (f === 1) { d.holdLeft = 50 + Math.min(70, t.percent * 0.5); d.pummelWait = 0; }   // harder to escape at high damage
+      if (--d.holdLeft <= 0) { me.releaseGrab(); return; }
+      if (d.pummelWait > 0) d.pummelWait--;
+      if (f < 5) return;                              // a short moment before you can throw
+      const dirX = dirOf(inp);
+      if (inp.up) me.startMove('uthrow');
+      else if (inp.down) me.startMove('dthrow');
+      else if (dirX === me.facing) me.startMove('fthrow');
+      else if (dirX === -me.facing) me.startMove('bthrow');
+      else if ((inp.attackP || inp.grabP) && d.pummelWait <= 0) { me.pummel(t); d.pummelWait = 14; }
+    } },
+  fthrow: makeThrow('Forward Throw', 'punch', { dmg: 8, bkb: 6, kbs: 0.16, angle: 40 }),
+  bthrow: makeThrow('Back Throw', 'fairSwing', { dmg: 9, bkb: 6.5, kbs: 0.18, angle: 40 }, true),
+  uthrow: makeThrow('Up Throw', 'armArc', { dmg: 7, bkb: 7, kbs: 0.15, angle: 90 }),
+  dthrow: makeThrow('Down Throw', 'castDown', { dmg: 6, bkb: 5, kbs: 0.08, angle: 75 }),   // pops them up for a combo
+};
+for (const id in FIGHTERS) FIGHTERS[id].moves = Object.assign({}, COMMON_MOVES, FIGHTERS[id].moves);
 
 // The order fighters appear on the character select screen.
 const FIGHTER_ORDER = ['pyro', 'tide', 'volt', 'lumen', 'umbra'];
@@ -1555,6 +1621,230 @@ const STAGES = [
       }
     },
   },
+
+  // -------------------------------------------------------------------
+  // MAGMA FORGE: one long iron bridge over a lava sea. Two low grates.
+  {
+    id: 'forge',
+    name: 'Magma Forge',
+    desc: 'A long iron bridge over a sea of lava. Lots of room to brawl, not many places to hide.',
+    platforms: [
+      { x: 190, y: 510, w: 900, h: 60, solid: true, ledges: true },
+      { x: 300, y: 392, w: 170, h: 14, solid: false, glow: '#ff7b00' },
+      { x: 810, y: 392, w: 170, h: 14, solid: false, glow: '#ff7b00' },
+    ],
+    blast: { left: -300, right: 1580, top: -300, bottom: 1020 },
+    spawns: [{ x: 440, y: 510 }, { x: 840, y: 510 }],
+    respawn: { x: 640, y: 160 },
+
+    // Background: a red sky, volcanoes, forge chimneys and the lava sea.
+    drawBackground(c, cam, t) {
+      const g = c.createLinearGradient(0, 0, 0, H);
+      g.addColorStop(0, '#120304'); g.addColorStop(0.5, '#3d0b07'); g.addColorStop(0.85, '#8a2410'); g.addColorStop(1, '#d8541a');
+      c.fillStyle = g; c.fillRect(0, 0, W, H);
+
+      withParallax(c, cam, 0.12, () => {               // three volcanoes with glowing craters
+        [[200, 330, 380], [700, 250, 520], [1150, 360, 360]].forEach(([x, top, half], i) => {
+          c.fillStyle = i === 1 ? '#2a0807' : '#200605';
+          c.beginPath(); c.moveTo(x - half, 900); c.lineTo(x - 40, top); c.lineTo(x + 40, top); c.lineTo(x + half, 900); c.closePath(); c.fill();
+          const glow = 0.6 + 0.25 * Math.sin(t * 0.03 + i * 2);
+          const cg = c.createRadialGradient(x, top, 4, x, top, 90);
+          cg.addColorStop(0, 'rgba(255,200,80,' + glow + ')'); cg.addColorStop(1, 'rgba(255,80,0,0)');
+          c.fillStyle = cg; c.beginPath(); c.arc(x, top, 90, 0, Math.PI * 2); c.fill();
+          c.strokeStyle = 'rgba(255,110,20,0.55)'; c.lineWidth = 6;            // a lava stream down the side
+          c.beginPath(); c.moveTo(x + 10, top + 4);
+          for (let k = 1; k <= 6; k++) c.lineTo(x + 10 + k * half / 9 + Math.sin(k * 1.7 + i) * 12, top + k * (900 - top) / 7);
+          c.stroke();
+        });
+      });
+
+      withParallax(c, cam, 0.4, () => {                // forge chimneys puffing smoke
+        for (let i = 0; i < 4; i++) {
+          const x = -150 + i * 520, top = 420 + (i % 2) * 60;
+          c.fillStyle = '#1b0a08'; c.fillRect(x - 30, top, 60, 700);
+          c.fillStyle = '#2c120d'; c.fillRect(x - 38, top - 12, 76, 16);
+          c.fillStyle = 'rgba(255,120,30,0.5)'; c.fillRect(x - 18, top + 60, 36, 8);   // glowing vent
+          for (let k = 0; k < 6; k++) {
+            const age = (t * 0.6 + k * 40 + i * 23) % 240;
+            c.fillStyle = 'rgba(60,40,40,' + (0.35 * (1 - age / 240)) + ')';
+            c.beginPath(); c.arc(x + Math.sin(age * 0.03 + k) * 20 + age * 0.3, top - age, 16 + age * 0.15, 0, Math.PI * 2); c.fill();
+          }
+        }
+      });
+
+      withParallax(c, cam, 0.6, () => {                // embers floating up
+        c.save(); c.globalCompositeOperation = 'lighter';
+        for (let i = 0; i < 40; i++) {
+          const x = (i * 211.3) % 1900 - 300 + Math.sin(t * 0.02 + i) * 30;
+          const y = 1000 - ((t * (0.6 + (i % 5) * 0.25) + i * 83) % 1300);
+          c.fillStyle = i % 3 ? 'rgba(255,140,40,0.8)' : 'rgba(255,220,120,0.9)';
+          c.fillRect(x, y, 3, 3);
+        }
+        c.restore();
+      });
+
+      withParallax(c, cam, 0.85, () => {               // the lava sea, with rolling waves
+        const top = 820;
+        const lg = c.createLinearGradient(0, top, 0, top + 300);
+        lg.addColorStop(0, '#ffcf4a'); lg.addColorStop(0.15, '#ff6a00'); lg.addColorStop(1, '#7a1500');
+        c.fillStyle = lg;
+        c.beginPath(); c.moveTo(-800, top + 400);
+        for (let x = -800; x <= 2100; x += 40) c.lineTo(x, top + Math.sin(x * 0.012 + t * 0.04) * 10 + Math.sin(x * 0.03 - t * 0.06) * 5);
+        c.lineTo(2100, top + 400); c.closePath(); c.fill();
+      });
+    },
+
+    // Foreground: the iron bridge, its stone pillars and the hot grates.
+    drawStage(c, t) {
+      const p = this.platforms[0];
+      [p.x + 140, p.x + p.w - 140].forEach(x => {     // stone pillars going down into the lava
+        const pg = c.createLinearGradient(x - 40, 0, x + 40, 0);
+        pg.addColorStop(0, '#2a1a1a'); pg.addColorStop(0.5, '#4a2c26'); pg.addColorStop(1, '#1e1212');
+        c.fillStyle = pg; c.fillRect(x - 40, p.y + p.h, 80, 420);
+        c.fillStyle = 'rgba(255,90,0,0.25)'; c.fillRect(x - 40, p.y + p.h + 300, 80, 120);   // lava glow on the stone
+      });
+      // the bridge: dark iron with glowing hot seams and rivets
+      const bg = c.createLinearGradient(0, p.y, 0, p.y + p.h);
+      bg.addColorStop(0, '#6d5a55'); bg.addColorStop(0.2, '#3d302e'); bg.addColorStop(1, '#1f1715');
+      c.fillStyle = bg; c.fillRect(p.x, p.y, p.w, p.h);
+      c.save(); c.globalCompositeOperation = 'lighter';
+      for (let x = p.x + 90; x < p.x + p.w; x += 90) {
+        const heat = 0.35 + 0.25 * Math.sin(t * 0.05 + x * 0.02);
+        c.fillStyle = 'rgba(255,90,10,' + heat + ')'; c.fillRect(x - 2, p.y + 10, 4, p.h - 10);
+      }
+      c.fillStyle = 'rgba(255,150,40,0.8)'; c.fillRect(p.x, p.y, p.w, 4);       // hot top edge
+      c.fillStyle = 'rgba(255,120,20,0.2)'; c.fillRect(p.x, p.y - 4, p.w, 12);
+      c.restore();
+      c.fillStyle = '#8a7570';
+      for (let x = p.x + 20; x < p.x + p.w; x += 45) { c.beginPath(); c.arc(x, p.y + 20, 3, 0, Math.PI * 2); c.fill(); }
+      // anvils on each end
+      [p.x + 30, p.x + p.w - 30].forEach(ax => {
+        c.fillStyle = '#2b2422';
+        c.fillRect(ax - 16, p.y - 14, 32, 14); c.fillRect(ax - 22, p.y - 22, 44, 9);
+      });
+      // the floating grates
+      for (const fp of this.platforms) {
+        if (fp.solid) continue;
+        c.fillStyle = '#3a2c28'; c.fillRect(fp.x, fp.y, fp.w, fp.h + 4);
+        c.strokeStyle = '#1a1210'; c.lineWidth = 2;
+        for (let x = fp.x + 12; x < fp.x + fp.w; x += 14) { c.beginPath(); c.moveTo(x, fp.y + 3); c.lineTo(x, fp.y + fp.h + 2); c.stroke(); }
+        c.save(); c.globalCompositeOperation = 'lighter';
+        c.fillStyle = rgba(fp.glow, 0.9); c.fillRect(fp.x + 4, fp.y, fp.w - 8, 3);
+        c.fillStyle = rgba(fp.glow, 0.2); c.fillRect(fp.x, fp.y - 3, fp.w, 9);
+        c.restore();
+        c.strokeStyle = '#2a2020'; c.lineWidth = 3;    // chains holding the grate up
+        c.beginPath(); c.moveTo(fp.x + 10, fp.y); c.lineTo(fp.x + 10, fp.y - 400); c.moveTo(fp.x + fp.w - 10, fp.y); c.lineTo(fp.x + fp.w - 10, fp.y - 400); c.stroke();
+      }
+    },
+  },
+
+  // -------------------------------------------------------------------
+  // STORM SPIRE: a small rocky peak in a thunderstorm. Two platforms hang
+  // out past the edges, and the small stage means early KOs.
+  {
+    id: 'spire',
+    name: 'Storm Spire',
+    desc: 'A tiny peak inside a thunderstorm. A small stage means big launches - watch the edges!',
+    platforms: [
+      { x: 420, y: 520, w: 440, h: 60, solid: true, ledges: true },
+      { x: 545, y: 395, w: 190, h: 14, solid: false, glow: '#ffd60a' },
+      { x: 240, y: 435, w: 130, h: 14, solid: false, glow: '#7fd8ff' },
+      { x: 910, y: 435, w: 130, h: 14, solid: false, glow: '#7fd8ff' },
+    ],
+    blast: { left: -220, right: 1500, top: -280, bottom: 1000 },
+    spawns: [{ x: 520, y: 520 }, { x: 760, y: 520 }],
+    respawn: { x: 640, y: 170 },
+
+    // Background: storm clouds, rain, and a lightning strike every few seconds.
+    drawBackground(c, cam, t) {
+      const strike = t % 260;                          // 0..259: lightning at the start of each cycle
+      const flash = strike < 10 ? (strike % 4 < 2 ? 1 : 0.4) * (1 - strike / 10) : 0;
+      const g = c.createLinearGradient(0, 0, 0, H);
+      g.addColorStop(0, '#05070f'); g.addColorStop(0.55, '#141c33'); g.addColorStop(1, '#2b3550');
+      c.fillStyle = g; c.fillRect(0, 0, W, H);
+
+      withParallax(c, cam, 0.1, () => {                // the far lightning bolt
+        if (strike >= 14) return;
+        const r = seededRandom(Math.floor(t / 260) * 7 + 3);
+        let x = 150 + r() * 980, y = -20;
+        c.strokeStyle = 'rgba(220,235,255,' + (1 - strike / 14) + ')'; c.lineWidth = 4; c.lineJoin = 'round';
+        c.beginPath(); c.moveTo(x, y);
+        while (y < 560) { x += (r() - 0.5) * 70; y += 30 + r() * 40; c.lineTo(x, y); }
+        c.stroke();
+      });
+
+      const clouds = (factor, y, color, speed, n) => withParallax(c, cam, factor, () => {
+        c.fillStyle = color;
+        for (let i = 0; i < n; i++) {
+          const x = ((i * 330 + t * speed) % 2600) - 700;
+          c.beginPath(); c.ellipse(x, y + (i % 3) * 30, 260, 70, 0, 0, Math.PI * 2); c.fill();
+          c.beginPath(); c.ellipse(x + 150, y - 30 + (i % 2) * 20, 180, 60, 0, 0, Math.PI * 2); c.fill();
+        }
+      });
+      clouds(0.2, 120, '#1a2238', 0.15, 8);
+      withParallax(c, cam, 0.3, () => {                // distant rocky spires
+        c.fillStyle = '#121828';
+        [[60, 380], [330, 300], [1000, 330], [1260, 410]].forEach(([x, top]) => {
+          c.beginPath(); c.moveTo(x - 90, 900); c.lineTo(x - 20, top); c.lineTo(x + 25, top + 20); c.lineTo(x + 100, 900); c.closePath(); c.fill();
+        });
+      });
+      clouds(0.5, 760, '#222b45', 0.35, 9);
+
+      c.strokeStyle = 'rgba(170,190,230,0.25)'; c.lineWidth = 1.5;   // rain (screen space)
+      c.beginPath();
+      for (let i = 0; i < 90; i++) {
+        const x = (i * 97.3 + t * 3) % (W + 100) - 50, y = (i * 61.7 + t * 14) % (H + 40) - 20;
+        c.moveTo(x, y); c.lineTo(x - 5, y + 18);
+      }
+      c.stroke();
+      if (flash > 0) { c.fillStyle = 'rgba(200,220,255,' + flash * 0.35 + ')'; c.fillRect(0, 0, W, H); }
+    },
+
+    // Foreground: the rock peak, a lightning rod, and the floating stones.
+    drawStage(c, t) {
+      const p = this.platforms[0];
+      // the peak narrows down into the clouds
+      const rg = c.createLinearGradient(0, p.y, 0, p.y + 380);
+      rg.addColorStop(0, '#3b4560'); rg.addColorStop(1, '#0d1220');
+      c.fillStyle = rg;
+      c.beginPath(); c.moveTo(p.x, p.y); c.lineTo(p.x + p.w, p.y);
+      c.lineTo(p.x + p.w - 60, p.y + 120); c.lineTo(p.x + p.w / 2 + 40, p.y + 380); c.lineTo(p.x + p.w / 2 - 50, p.y + 380); c.lineTo(p.x + 70, p.y + 140);
+      c.closePath(); c.fill();
+      c.strokeStyle = 'rgba(0,0,0,0.3)'; c.lineWidth = 2;   // cracks
+      c.beginPath(); c.moveTo(p.x + 120, p.y + 20); c.lineTo(p.x + 160, p.y + 90); c.lineTo(p.x + 150, p.y + 160);
+      c.moveTo(p.x + 320, p.y + 15); c.lineTo(p.x + 290, p.y + 100); c.stroke();
+      // the walking surface glows with static electricity
+      c.save(); c.globalCompositeOperation = 'lighter';
+      const buzz = 0.5 + 0.3 * Math.sin(t * 0.3);
+      c.fillStyle = 'rgba(127,216,255,' + buzz + ')'; c.fillRect(p.x, p.y, p.w, 4);
+      c.fillStyle = 'rgba(127,216,255,0.15)'; c.fillRect(p.x, p.y - 4, p.w, 12);
+      c.restore();
+      // a lightning rod at the back of each edge, with a spark at the tip
+      [p.x + 40, p.x + p.w - 40].forEach((x, i) => {
+        c.fillStyle = '#596580'; c.fillRect(x - 3, p.y - 70, 6, 70);
+        c.fillStyle = '#8792ad'; c.beginPath(); c.moveTo(x - 7, p.y - 70); c.lineTo(x, p.y - 86); c.lineTo(x + 7, p.y - 70); c.fill();
+        if ((t + i * 37) % 90 < 6) {
+          c.save(); c.globalCompositeOperation = 'lighter';
+          const sg = c.createRadialGradient(x, p.y - 88, 1, x, p.y - 88, 22);
+          sg.addColorStop(0, 'rgba(255,255,255,0.95)'); sg.addColorStop(1, 'rgba(255,214,10,0)');
+          c.fillStyle = sg; c.beginPath(); c.arc(x, p.y - 88, 22, 0, Math.PI * 2); c.fill();
+          c.restore();
+        }
+      });
+      // floating stones (pass-through platforms)
+      for (const fp of this.platforms) {
+        if (fp.solid) continue;
+        c.fillStyle = '#3a4460';
+        c.beginPath(); c.moveTo(fp.x, fp.y); c.lineTo(fp.x + fp.w, fp.y);
+        c.lineTo(fp.x + fp.w - 18, fp.y + fp.h + 14); c.lineTo(fp.x + fp.w / 2, fp.y + fp.h + 34); c.lineTo(fp.x + 18, fp.y + fp.h + 14);
+        c.closePath(); c.fill();
+        c.save(); c.globalCompositeOperation = 'lighter';
+        c.fillStyle = rgba(fp.glow, 0.85); c.fillRect(fp.x + 4, fp.y, fp.w - 8, 3);
+        c.fillStyle = rgba(fp.glow, 0.2); c.fillRect(fp.x, fp.y - 3, fp.w, 9);
+        c.restore();
+      }
+    },
+  },
 ];
 
 // Work out where every stage's ledges are (both ends of solid platforms).
@@ -1659,6 +1949,7 @@ const ATTACK_POSES = {
   dash:     { wind: { crouch: 0.4, lean: 0.4, aF: -0.5, aB: -0.6 }, hit: { lean: 0.75, aF: -1.3, eF: 0.3, aB: -1.5, eB: 0.3, lF: 0.9, kF: 1.3, lB: -0.7, kB: 0.9 } },
   rocket:   { wind: { crouch: 0.6, aF: 0.6, aB: 0.6, eF: 1.0, eB: 1.0 }, hit: { aF: 3.05, aB: 2.95, eF: 0, eB: 0, lF: 0.1, kF: 0.05, lB: -0.1, kB: 0.1, lean: 0 } },
   guard:    { wind: { crouch: 0.2 }, hit: { aF: 1.9, eF: 1.7, aB: 1.7, eB: 1.9, crouch: 0.25, lean: 0.1 } },
+  grab:     { wind: { aF: 0.9, eF: 1.3, aB: 0.8, eB: 1.4, lean: -0.05 }, hit: { aF: 1.6, eF: 0.15, aB: 1.45, eB: 0.25, lean: 0.35, lF: 0.5, kF: 0.3, lB: -0.4, kB: 0.25 } },
   glide:    { wind: {}, hit: { aF: 1.7, eF: 0.1, aB: 1.3, eB: 0.1, lean: 0.9, lF: -0.3, kF: 0.4, lB: -0.6, kB: 0.6 } },
 };
 
@@ -2063,7 +2354,7 @@ class Fighter {
     this.ledge = null; this.ledgeCooldown = 0; this.dropTimer = 0; this.crouchTimer = 0;
     this.slowTimer = 0; this.slowAcc = 0; this.trapTimer = 0;
     this.grabbedBy = null; this.grabbing = null; this.counterDmg = 0;
-    this.attackBuf = 0; this.specialBuf = 0; this.jumpBuf = 0; this.shieldBuf = 0;
+    this.attackBuf = 0; this.specialBuf = 0; this.jumpBuf = 0; this.shieldBuf = 0; this.grabBuf = 0;
     this.attackHold = 0;                   // frames the attack button has been held
     this.chargeMove = ''; this.chargeFrames = 0; this.chargeMult = 1; this.chargeFlash = 0;
     this.pendingDI = false;
@@ -2182,7 +2473,7 @@ class Fighter {
       case 'trapped': this.updateTrapped(inp); break;
       case 'ledge': this.updateLedge(inp); physics = false; break;     // these states skip physics
       case 'ledgeclimb': this.updateLedgeClimb(); physics = false; break;
-      case 'grabbed': this.updateGrabbed(); physics = false; break;
+      case 'grabbed': this.updateGrabbed(inp); physics = false; break;
       case 'respawn': this.updateRespawn(inp); physics = false; break;
     }
     if (this.state === 'dead' || this.state === 'out') return;
@@ -2205,6 +2496,7 @@ class Fighter {
     else if (!(inp.attack && this.attackBuf > 0)) this.attackBuf = Math.max(0, this.attackBuf - tick);
     this.attackHold = inp.attack ? this.attackHold + 1 : 0;
     this.specialBuf = inp.specialP ? B : Math.max(0, this.specialBuf - tick);
+    this.grabBuf = inp.grabP ? B : Math.max(0, this.grabBuf - tick);
     this.shieldBuf = inp.shieldP ? B : Math.max(0, this.shieldBuf - tick);
     this.jumpBuf = inp.jumpP ? TUNING.jumpBufferFrames : Math.max(0, this.jumpBuf - tick);
   }
@@ -2239,6 +2531,7 @@ class Fighter {
   // Check buttons while standing. Returns true if something started.
   tryGroundAction(inp) {
     const dirX = dirOf(inp);
+    if (this.grabBuf) { this.grabBuf = 0; this.startMove('grab'); return true; }
     if (this.attackBuf) {
       // Tap (released before CHARGE_HOLD_FRAMES) = normal attack; hold = charge.
       const stillDeciding = inp.attack && this.attackHold < CHARGE_HOLD_FRAMES;
@@ -2328,6 +2621,7 @@ class Fighter {
   updateAir(inp) {
     const dirX = dirOf(inp);
     if (this.attackBuf) { this.attackBuf = 0; this.airAttack(inp, dirX); return; }   // aerials come out instantly
+    if (this.grabBuf) { this.grabBuf = 0; this.airAttack(inp, dirX); return; }       // no grabs in the air: Grab = aerial
     if (this.specialBuf) {
       this.specialBuf = 0;
       if (this.doSpecial(inp, dirX)) return;
@@ -2511,6 +2805,7 @@ class Fighter {
     if (this.shieldStun > 0) { this.shieldStun--; return; }
     if (inp.leftP || inp.rightP) { this.startDodge('roll', inp.leftP ? -1 : 1); return; }
     if (inp.downP) { this.startDodge('spot', 0); return; }
+    if (this.grabBuf) { this.grabBuf = 0; this.startMove('grab'); return; }        // shield grab
     if (this.jumpBuf) { this.jumpBuf = 0; this.state = 'jumpsquat'; this.stateTimer = 0; return; }
     if (!inp.shield) {
       if (this.stateTimer <= TUNING.shieldTapFrames) this.startDodge('spot', 0);
@@ -2653,7 +2948,7 @@ class Fighter {
     this.noGravity = true;
     this.vx = 0; this.vy = -0.5; this.kbx = this.kby = 0;
     // mash any button to escape faster
-    if (inp.attackP || inp.specialP || inp.jumpP || inp.upP || inp.leftP || inp.rightP || inp.downP || inp.shieldP) this.trapTimer -= 4;
+    if (mashed(inp)) this.trapTimer -= 4;
     if (--this.trapTimer <= 0) {
       this.state = 'hitstun'; this.hitstun = 14; this.kby = -5.5;
       Sound.play('pop');
@@ -2667,16 +2962,42 @@ class Fighter {
     this.vx = this.vy = this.kbx = this.kby = 0;
     this.grounded = false; this.platform = null;
   }
-  updateGrabbed() {
+  updateGrabbed(inp) {
     const g = this.grabbedBy;
-    if (!g || g.state !== 'attack' || g.moveName !== 'sspecialPull' || g.grabbing !== this) {
+    if (!g || g.state !== 'attack' || !g.move.holdsGrab || g.grabbing !== this) {
       this.grabbedBy = null; this.state = 'air';      // the grabber got interrupted: we're free
       return;
     }
+    if (mashed(inp) && g.moveName === 'grabHold') g.moveData.holdLeft -= 3;   // mash to escape
     // get pulled toward the spot in front of the grabber
     this.x = lerp(this.x, g.x + g.facing * (g.halfW + this.halfW + 4), 0.25);
     this.y = lerp(this.y, g.y, 0.25);
     this.facing = -g.facing;
+  }
+
+  // Let go of the grabbed fighter: both get pushed apart a little.
+  releaseGrab() {
+    const t = this.grabbing;
+    this.grabbing = null;
+    if (t && t.state === 'grabbed') {
+      t.grabbedBy = null;
+      t.state = 'hitstun'; t.hitstun = 12;
+      t.kbx = this.facing * 5; t.kby = -3;
+    }
+    this.vx = -this.facing * 3;
+    this.endMove();
+  }
+
+  // A small hit on the fighter you're holding.
+  pummel(t) {
+    const dmg = 2;
+    t.percent = Math.min(999, t.percent + dmg);
+    this.stats.damageDealt += dmg;
+    t.lastHitBy = this; t.hitFlash = 3; t.hudPop = 10; t.hudShake = 8;
+    this.hitlag = 4; t.hitlag = 4;
+    this.match.texts.push({ x: t.x, y: t.y - t.def.height - 10, vy: -2.4, life: 40, text: dmg + '%', color: this.palette.light });
+    emitElement(this.def.element, this.palette.fx, t.x, t.y - t.def.height / 2, 10, 3);
+    Sound.play('hit');
   }
 
   // ------------------------------------------------------- DEATH / RESPAWN
@@ -2694,7 +3015,7 @@ class Fighter {
     this.invuln = 120;                                // invincible until you leave + 2 seconds
     const r = this.match.stage.respawn;
     this.x = r.x; this.y = r.y;
-    const anyInput = inp.left || inp.right || inp.down || inp.jumpP || inp.upP || inp.attackP || inp.specialP || inp.shieldP;
+    const anyInput = inp.left || inp.right || inp.down || mashed(inp);
     if ((this.stateTimer > 30 && anyInput) || this.stateTimer > 240) {
       this.state = 'air'; this.vy = 0;
     }
@@ -3326,6 +3647,7 @@ class Match {
     this.online = !!opts.online;
     this.localIndex = opts.localIndex || 0;
     this.inputs = null;                              // online: [P1 input, P2 input] for this frame
+    this.over = false; this.result = null;           // online: set by finish()
     this.stage = STAGES[sel.stage] || STAGES[0];
     const sameFighter = sel.p1 === sel.p2;           // mirror match: P2 gets the alternate colours
     this.fighters = [new Fighter(this, 0, sel.p1, false), new Fighter(this, 1, sel.p2, sameFighter)];
@@ -3373,6 +3695,7 @@ class Match {
       return;
     }
     if (this.paused) { this.pauseMenu.update(); return; }
+    if (this.over) return;
 
     this.timer++;
     if (this.phase === 'countdown') {
@@ -3484,8 +3807,8 @@ class Match {
     if (hb.effect === 'grab') {
       t.getGrabbed(a);
       a.grabbing = t;
-      a.startMove('sspecialPull');
-      Sound.play('dark');
+      a.startMove(hb.grabMove || 'sspecialPull');     // the move that holds them (Umbra's tendril pulls)
+      Sound.play(hb.grabMove ? 'grab' : 'dark');
       return;
     }
     if (hb.effect === 'trap') {
@@ -3616,11 +3939,15 @@ class Match {
 
   finish() {
     const alive = this.fighters.filter(f => f.stocks > 0);
-    Game.lastResult = {
+    const result = {
       online: this.online,
       winner: alive.length === 1 ? alive[0].index : -1,
       players: this.fighters.map(f => ({ id: f.id, palette: f.palette, name: f.def.name, stats: Object.assign({}, f.stats), stocks: f.stocks })),
     };
+    // online: just mark the match as over - Net shows the results once both
+    // players' buttons up to this frame are confirmed
+    if (this.online) { this.over = true; this.result = result; return; }
+    Game.lastResult = result;
     Game.setScreen('results');
   }
 
@@ -4051,8 +4378,8 @@ SCREENS.controls = {
     this.msg = ''; this.msgTimer = 0; this.msgWarn = false;
     this.sel = { col: 0, row: 0 };       // keyboard cursor: rows 0-7 actions, 8 reset, 9 back
   },
-  rowRect(p, i) { return { x: p === 0 ? 150 : 670, y: 138 + i * 44, w: 460, h: 38 }; },
-  resetRect(p) { return { x: (p === 0 ? 150 : 670) + 120, y: 498, w: 220, h: 42 }; },
+  rowRect(p, i) { return { x: p === 0 ? 150 : 670, y: 136 + i * 40, w: 460, h: 35 }; },
+  resetRect(p) { return { x: (p === 0 ? 150 : 670) + 120, y: 502, w: 220, h: 40 }; },
   backRect: { x: 520, y: 642, w: 240, h: 50 },
   setMsg(text) { this.msg = text; this.msgTimer = 240; this.msgWarn = text.startsWith('Warning'); },
   leave() {
@@ -4133,7 +4460,7 @@ SCREENS.controls = {
       drawText(c, this.msg, W / 2, 566, { size: 18, color: this.msgWarn ? '#ffb347' : '#7dff9a', stroke: 3 });
       c.globalAlpha = 1;
     }
-    drawText(c, 'Up + Attack = up attack   ·   Up + Special = recovery   ·   Down + Attack in the air = down aerial',
+    drawText(c, 'Up + Attack = up attack  ·  Up + Special = recovery  ·  Grab, then a direction = throw (Attack = pummel)',
       W / 2, 596, { size: 15, weight: 'normal', color: '#c9bde6' });
     drawText(c, 'Hold Attack to charge   ·   Tap Shield to dodge (direction = movement keys), hold it to shield   ·   Esc = pause   ·   M = mute',
       W / 2, 618, { size: 15, weight: 'normal', color: '#c9bde6' });
@@ -4357,8 +4684,9 @@ SCREENS.charSelect = {
 SCREENS.stageSelect = {
   enter() {
     this.index = clamp(Game.sel.stage || 0, 0, STAGES.length - 1);
-    const cardW = 440, gap = 40, total = STAGES.length * cardW + (STAGES.length - 1) * gap;
-    this.cards = STAGES.map((s, i) => ({ x: W / 2 - total / 2 + i * (cardW + gap), y: 150, w: cardW, h: 260 }));
+    const gap = 30, n = STAGES.length;
+    const cardW = Math.min(440, (W - 80 - (n - 1) * gap) / n), total = n * cardW + (n - 1) * gap;
+    this.cards = STAGES.map((s, i) => ({ x: W / 2 - total / 2 + i * (cardW + gap), y: 160, w: cardW, h: Math.round(cardW * 0.59) }));
     this.backBtn = { label: '◀ BACK', x: 540, y: 620, w: 200, h: 56 };
   },
   start() { Game.sel.stage = this.index; Sound.play('menuSelect'); Game.setScreen('fight'); },
@@ -4392,7 +4720,7 @@ SCREENS.stageSelect = {
       if (sel) { c.shadowColor = '#ffb347'; c.shadowBlur = 20; }
       c.stroke();
       c.restore();
-      drawText(c, s.name.toUpperCase(), r.x + r.w / 2, r.y + r.h + 36, { size: 30, color: sel ? '#ffe27a' : '#ffffff', font: TITLE_FONT, weight: 'normal' });
+      drawText(c, s.name.toUpperCase(), r.x + r.w / 2, r.y + r.h + 36, { size: 28, color: sel ? '#ffe27a' : '#ffffff', font: TITLE_FONT, weight: 'normal' });
       c.font = 'normal 17px ' + FONT;
       wrapText(c, s.desc, r.w).forEach((line, k) => drawText(c, line, r.x + r.w / 2, r.y + r.h + 70 + k * 22, { size: 17, weight: 'normal', color: '#d8c8ff' }));
     });
@@ -4500,23 +4828,28 @@ SCREENS.results = {
    PeerJS's free public server only introduces the two browsers - after
    that, game messages go straight from one computer to the other.
 
-   LOCKSTEP: both computers run the SAME match code with the SAME button
+   ROLLBACK: both computers run the SAME match code with the SAME button
    presses, so both games stay identical. Every frame you send your
-   buttons to your rival, and a frame only runs once BOTH players'
-   buttons for it have arrived. To hide the time a message takes to
-   travel, your presses are scheduled a few frames in the future
-   ("input delay", picked from the ping when the match starts).
+   buttons to your rival. Your own buttons work straight away; for the
+   rival's buttons that haven't arrived yet, the game GUESSES (they're
+   probably still holding what they held last) and keeps going, so it
+   never has to freeze and wait. Before each frame it saves a copy of
+   the whole match. When the rival's real buttons arrive and the guess
+   was wrong, it jumps back ("rolls back") to the saved copy and quickly
+   re-plays the frames since then with the right buttons - usually only
+   1-3 frames, so you barely notice.
 
    The host is always Player 1 (red), the friend who joins is Player 2.
    Online, both players use their own PLAYER 1 controls.
    ======================================================================= */
 
 const NET_ROOM_PREFIX = 'elemental-clash-room-';            // + the room code = the host's peer ID
-const NET_VERSION = 1;                                      // both players need the same game version
+const NET_VERSION = 2;                                      // both players need the same game version
 const CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';    // no O/0 or I/1 - they look alike
 const CODE_LENGTH = 5;
 const NET_TIMEOUT_MS = 10000;                               // nothing heard for this long = connection lost
 const NET_CONNECT_TIMEOUT_MS = 15000;                       // give up joining after this long
+const MAX_PREDICT = 12;           // never guess more than this many frames ahead (then wait for the rival)
 
 function makeRoomCode() {
   let code = '';
@@ -4525,13 +4858,14 @@ function makeRoomCode() {
 }
 
 // Your buttons are packed into ONE number to send over the network:
-// bits 0-7 = held (one bit per action in ACTIONS), bits 8-15 = pressed this frame.
+// bits 0-15 = held (one bit per action in ACTIONS), bits 16-31 = pressed this frame.
+const HELD_BITS = 0xffff;
 function readLocalBits() {
   const k = CONTROLS[0];
   let bits = 0;
   ACTIONS.forEach((a, i) => {
     if (Input.isDown(k[a])) bits |= 1 << i;
-    if (Input.wasPressed(k[a])) bits |= 1 << (i + 8);
+    if (Input.wasPressed(k[a])) bits |= 1 << (i + 16);
   });
   return bits;
 }
@@ -4540,13 +4874,59 @@ function decodeInput(bits) {
   const inp = {};
   ACTIONS.forEach((a, i) => {
     inp[a] = (bits & (1 << i)) !== 0;
-    inp[a + 'P'] = (bits & (1 << (i + 8))) !== 0;
+    inp[a + 'P'] = (bits & (1 << (i + 16))) !== 0;
   });
   return inp;
 }
 
+// ---------------------------------------------------------------------
+// SAVING A COPY OF THE MATCH (for rollback)
+// cloneMatch() copies the match, its fighters, projectiles, effects and
+// everything inside them. Things that never change during a fight -
+// fighter data, moves, stages - are shared, not copied (that's STATIC).
+// ---------------------------------------------------------------------
+const STATIC = new WeakSet();
+(function markStatic(v) {
+  if (v === null || typeof v !== 'object' || STATIC.has(v)) return;
+  STATIC.add(v);
+  for (const k of Object.keys(v)) markStatic(v[k]);
+})([FIGHTERS, STAGES, PROJECTILE_KINDS, NO_INPUT]);
+const CLONE_CLASSES = new Set([Object.getPrototypeOf({}), Match.prototype, Fighter.prototype, Projectile.prototype]);   // {} = plain objects
+
+function cloneMatch(match) {
+  const copies = new Map();                          // original -> copy (keeps links between objects right)
+  function copy(v) {
+    if (v === null || typeof v !== 'object' || STATIC.has(v)) return v;   // numbers, text, functions, data
+    if (copies.has(v)) return copies.get(v);
+    let out;
+    if (Array.isArray(v)) {
+      out = new Array(v.length); copies.set(v, out);
+      for (let i = 0; i < v.length; i++) out[i] = copy(v[i]);
+      return out;
+    }
+    if (v instanceof Map) {
+      out = new Map(); copies.set(v, out);
+      for (const [k, x] of v) out.set(copy(k), copy(x));
+      return out;
+    }
+    const proto = Object.getPrototypeOf(v);
+    if (!CLONE_CLASSES.has(proto)) return v;          // sounds, menus...: share
+    out = Object.create(proto); copies.set(v, out);
+    for (const k of Object.keys(v)) out[k] = copy(v[k]);
+    return out;
+  }
+  return copy(match);
+}
+
+// A short summary of a match, compared between the two computers.
+function matchChecksum(match) {
+  const fs = match.fighters.map(f => [f.x, f.y, f.vx, f.vy, f.kbx, f.kby, f.percent, f.stocks, f.state, f.moveName, f.moveFrame].join(','));
+  const ps = match.projectiles.map(p => [p.kind, p.x, p.y].join(','));
+  return fs.join('|') + '#' + ps.join('|') + '#' + match.timer;
+}
+
 const Net = {
-  peer: null, conn: null,
+  peer: null, conn: null, inputConn: null,
   isHost: false,
   code: '',
   peerOpen: false,          // true once the room exists on the PeerJS server
@@ -4554,19 +4934,29 @@ const Net = {
   status: '',               // message shown on the create/join screens
   connectStart: 0, lastHeard: 0, timer: null,
   rtt: 0,                   // ping: time for a message to go there and back (ms)
-  rttSamples: [],           // the last few pings, to pick a safe input delay
+  rttSamples: [],           // the last few pings
   me: { fighter: 'pyro', ready: false },
   them: { fighter: 'tide', ready: false },
   stage: 0,
-  // lockstep state (see tick)
-  matchId: 0, delay: 3, simFrame: 0, sendFrame: 0,
-  localInputs: {}, remoteInputs: {}, remoteMax: 0,
-  latch: 0, stall: 0, sums: {}, desync: false, menuOpen: false,
+  matchId: 0, delay: 2,
+  // rollback state (see tick)
+  frame: 0,                 // the next frame to run
+  confirmed: 0,             // every frame before this one used the rival's REAL buttons
+  sendFrame: 0,             // the next frame we send our buttons for
+  localInputs: {}, remoteInputs: {}, usedRemote: {}, snapshots: {}, sumAt: {}, early: {},
+  remoteMax: 0, lastRemoteBits: 0, remoteFrame: 0, remoteAhead: 0, aheadAvg: 0, rollbackFrom: Infinity,
+  latch: 0, stall: 0, tickCount: 0, rollbacks: 0,
+  sums: {}, sumEvery: 60, desync: false, menuOpen: false,
 
   get localIndex() { return this.isHost ? 0 : 1; },
   available() { return typeof Peer !== 'undefined'; },
 
   // ------------------------------------------------ CREATE / JOIN A ROOM
+  // Two connections are opened between the players:
+  //   'control' - lobby messages, in order (reliable)
+  //   'input'   - button presses. Delivered even if a packet is lost, but
+  //               NOT held back waiting for an older lost one, so a hiccup
+  //               doesn't hold up newer button presses.
   host() {
     this.shutdown();
     this.isHost = true;
@@ -4576,8 +4966,10 @@ const Net = {
     peer.on('open', () => { if (peer === this.peer) { this.peerOpen = true; this.status = 'Waiting for your friend to join...'; } });
     peer.on('connection', conn => {
       if (peer !== this.peer) return;
-      if (this.conn) { conn.on('open', () => conn.close()); return; }   // room is full
-      this.setupConnection(conn);
+      const full = conn.label === 'input' ? (this.inputConn || (this.conn && this.conn.peer !== conn.peer)) : this.conn;
+      if (full) { conn.on('open', () => conn.close()); return; }   // room is full
+      if (conn.label === 'input') this.setupInputConnection(conn);
+      else this.setupConnection(conn);
     });
     peer.on('error', err => { if (peer === this.peer) this.onPeerError(err); });
   },
@@ -4592,7 +4984,8 @@ const Net = {
     peer.on('open', () => {
       if (peer !== this.peer) return;
       this.peerOpen = true;
-      this.setupConnection(peer.connect(NET_ROOM_PREFIX + code, { reliable: true, serialization: 'json' }));
+      this.setupConnection(peer.connect(NET_ROOM_PREFIX + code, { label: 'control', reliable: true, serialization: 'json' }));
+      this.setupInputConnection(peer.connect(NET_ROOM_PREFIX + code, { label: 'input', reliable: false, serialization: 'json' }));
     });
     peer.on('error', err => { if (peer === this.peer) this.onPeerError(err); });
     this.startTimer();
@@ -4616,6 +5009,13 @@ const Net = {
     conn.on('close', () => { if (conn === this.conn) this.lost('Your rival left the room.'); });
     conn.on('error', () => { if (conn === this.conn) this.lost('The connection to your rival broke.'); });
   },
+  // If the input connection fails, button presses just go through 'control' instead.
+  setupInputConnection(conn) {
+    this.inputConn = conn;
+    conn.on('data', msg => { if (conn === this.inputConn) this.receive(msg); });
+    conn.on('close', () => { if (conn === this.inputConn) this.inputConn = null; });
+    conn.on('error', () => { if (conn === this.inputConn) this.inputConn = null; });
+  },
 
   onPeerError(err) {
     if (err.type === 'unavailable-id' && this.isHost && !this.connected) { this.host(); return; }   // code taken: pick another
@@ -4638,7 +5038,7 @@ const Net = {
     this.timer = setInterval(() => {
       const now = performance.now();
       if (this.connected) {
-        this.send({ t: 'ping', ts: now });
+        this.sendFast({ t: 'ping', ts: now });
         if (now - this.lastHeard > NET_TIMEOUT_MS) this.lost('Lost the connection to your rival.');
       } else if (!this.isHost && this.peer && now - this.connectStart > NET_CONNECT_TIMEOUT_MS) {
         this.fail("Couldn't connect to that room. Check the code and try again.");
@@ -4651,16 +5051,23 @@ const Net = {
       try { this.conn.send(msg); } catch (err) { /* the connection is closing */ }
     }
   },
+  // Button presses, pings and checksums use the faster 'input' connection when it's open.
+  sendFast(msg) {
+    if (this.inputConn && this.inputConn.open) {
+      try { this.inputConn.send(msg); return; } catch (err) { /* fall back to control */ }
+    }
+    this.send(msg);
+  },
 
   // Close everything and forget the room.
   shutdown() {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
-    const conn = this.conn, peer = this.peer;
-    this.conn = null; this.peer = null;               // set first, so their 'close' events are ignored
+    const conns = [this.conn, this.inputConn], peer = this.peer;
+    this.conn = null; this.inputConn = null; this.peer = null;   // set first, so their 'close' events are ignored
     this.connected = false; this.peerOpen = false;
     this.me.ready = this.them.ready = false;
     this.menuOpen = false;
-    try { if (conn) conn.close(); } catch (err) { /* already closed */ }
+    for (const c of conns) { try { if (c) c.close(); } catch (err) { /* already closed */ } }
     try { if (peer) peer.destroy(); } catch (err) { /* already gone */ }
   },
   // Couldn't create or join: stay on the same screen and say why.
@@ -4697,12 +5104,11 @@ const Net = {
         break;
       case 'start': if (!this.isHost) this.beginMatch(msg); break;
       case 'in':                                      // the rival's buttons for frame msg.f
-        if (msg.m !== this.matchId) return;
-        this.remoteInputs[msg.f] = msg.b;
-        this.remoteMax = Math.max(this.remoteMax, msg.f);
+        if (msg.m === this.matchId) this.takeRemoteInput(msg);
+        else if (msg.m > this.matchId) (this.early[msg.m] = this.early[msg.m] || []).push(msg);   // arrived before 'start'
         break;
       case 'sum': if (msg.m === this.matchId) this.recordSum(msg.f, msg.s, 'theirs'); break;
-      case 'ping': this.send({ t: 'pong', ts: msg.ts }); break;
+      case 'ping': this.sendFast({ t: 'pong', ts: msg.ts }); break;
       case 'pong':
         this.rtt = performance.now() - msg.ts;
         this.rttSamples.push(this.rtt);
@@ -4723,11 +5129,10 @@ const Net = {
   // The host starts the match as soon as both players are ready.
   tryStart() {
     if (!this.isHost || !this.connected || !this.me.ready || !this.them.ready || Game.screen !== 'onlineLobby') return;
-    // Input delay: enough frames to cover a one-way trip on the WORST recent ping
-    // (+20 ms for wobble, +1 frame for safety). Too small and the game stutters
-    // while it waits for the rival's buttons; too big and your moves feel slow.
-    const worst = Math.max(this.rtt, ...this.rttSamples);
-    const delay = clamp(Math.ceil((worst / 2 + 20) / STEP) + 1, 2, 10);
+    // A small input delay (1-4 frames) means fewer, smaller rollbacks;
+    // rollback hides the rest of the travel time.
+    const ping = this.rttSamples.length ? this.rttSamples.reduce((a, b) => a + b) / this.rttSamples.length : this.rtt;
+    const delay = clamp(Math.ceil(ping / 2 / STEP) - 1, 1, 4);
     const msg = { t: 'start', m: this.matchId + 1, p1: this.me.fighter, p2: this.them.fighter, stage: this.stage, delay };
     this.send(msg);
     this.beginMatch(msg);
@@ -4738,51 +5143,117 @@ const Net = {
     this.me.ready = this.them.ready = false;
     Game.sel = { p1: msg.p1, p2: msg.p2, stage: msg.stage };
     // the first "delay" frames have no buttons pressed on either side
-    this.localInputs = {}; this.remoteInputs = {};
+    this.localInputs = {}; this.remoteInputs = {}; this.usedRemote = {}; this.snapshots = {}; this.sumAt = {};
     for (let f = 0; f < this.delay; f++) this.localInputs[f] = this.remoteInputs[f] = 0;
-    this.simFrame = 0; this.sendFrame = this.delay; this.remoteMax = this.delay - 1;
-    this.latch = 0; this.stall = 0; this.sums = {}; this.desync = false; this.menuOpen = false;
+    this.frame = 0; this.confirmed = 0; this.sendFrame = this.delay;
+    this.remoteMax = this.delay - 1; this.lastRemoteBits = 0; this.remoteFrame = 0; this.remoteAhead = 0; this.aheadAvg = 0; this.rollbackFrom = Infinity;
+    this.latch = 0; this.stall = 0; this.tickCount = 0; this.rollbacks = 0;
+    this.sums = {}; this.desync = false; this.menuOpen = false;
     Game.setScreen('onlineFight');
+    const early = this.early[msg.m] || [];
+    this.early = {};
+    for (const m of early) this.takeRemoteInput(m);
   },
 
-  // ------------------------------------------------------- LOCKSTEP
-  // Called once per game update while an online match is on screen.
-  tick() {
-    const match = Game.match;
-    // remember presses until they are sent, so a quick tap is never lost
-    if (!this.menuOpen) this.latch |= readLocalBits() & 0xff00;
-    for (let step = 0; step < 2; step++) {
-      // 1. send my buttons for a frame that is "delay" frames in the future
-      if (this.sendFrame <= this.simFrame + this.delay) {
-        const bits = this.menuOpen ? 0 : (readLocalBits() & 0xff) | this.latch;
-        this.latch = 0;
-        this.localInputs[this.sendFrame] = bits;
-        this.send({ t: 'in', m: this.matchId, f: this.sendFrame, b: bits });
-        this.sendFrame++;
+  // The rival's buttons for one frame arrived.
+  takeRemoteInput(msg) {
+    const f = msg.f;
+    this.remoteFrame = Math.max(this.remoteFrame, msg.cf);          // where their game was when they sent it
+    if (f < this.confirmed || this.remoteInputs[f] !== undefined) return;
+    this.remoteInputs[f] = msg.b;
+    if (f > this.remoteMax) { this.remoteMax = f; this.lastRemoteBits = msg.b; this.remoteAhead = msg.ahead || 0; }
+    // Did we already run that frame with a wrong guess? Then roll back to it.
+    const used = this.usedRemote[f];
+    if (used !== undefined && used !== msg.b) this.rollbackFrom = Math.min(this.rollbackFrom, f);
+  },
+
+  // ------------------------------------------------------- ROLLBACK
+  // Run frame f: save a copy first, then update with the best buttons we have.
+  // "quiet" = re-playing an old frame (no sounds or particles again).
+  runFrame(quiet) {
+    const f = this.frame;
+    this.snapshots[f] = cloneMatch(Game.match);
+    const mine = this.localInputs[f];
+    // the rival's real buttons if we have them, otherwise guess: still holding
+    // what they held last time (but not pressing anything new)
+    const theirs = this.remoteInputs[f] !== undefined ? this.remoteInputs[f] : this.lastRemoteBits & HELD_BITS;
+    this.usedRemote[f] = theirs;
+    const p1 = this.isHost ? mine : theirs, p2 = this.isHost ? theirs : mine;
+    Game.match.inputs = [decodeInput(p1), decodeInput(p2)];
+    replaying = quiet;
+    Game.match.update();
+    replaying = false;
+    this.frame++;
+    if (this.frame % this.sumEvery === 0) this.sumAt[this.frame] = matchChecksum(Game.match);
+  },
+
+  // A guess was wrong: go back to the copy saved before that frame and re-play.
+  rollback() {
+    const from = this.rollbackFrom, to = this.frame;
+    this.rollbackFrom = Infinity;
+    if (from >= to || !this.snapshots[from]) return;
+    for (const f of Game.match.fighters) Sound.stopCharge(f);
+    Game.match = this.snapshots[from];
+    for (const f of Game.match.fighters) f.chargeSound = null;
+    this.frame = from;
+    while (this.frame < to) this.runFrame(true);
+    for (const f of Game.match.fighters) if (f.state === 'charging') Sound.startCharge(f);
+    this.rollbacks++;
+  },
+
+  // Frames where we now know both players' real buttons are final: forget their copies.
+  confirmFrames() {
+    while (this.confirmed < this.frame && this.remoteInputs[this.confirmed] !== undefined) {
+      const f = this.confirmed;
+      delete this.snapshots[f]; delete this.localInputs[f]; delete this.remoteInputs[f]; delete this.usedRemote[f];
+      this.confirmed++;
+      const s = this.sumAt[this.confirmed];
+      if (s !== undefined) {
+        delete this.sumAt[this.confirmed];
+        this.sendFast({ t: 'sum', m: this.matchId, f: this.confirmed, s });
+        this.recordSum(this.confirmed, s, 'mine');
       }
-      // 2. run the next frame - but only once BOTH players' buttons for it are here
-      const f = this.simFrame, mine = this.localInputs[f], theirs = this.remoteInputs[f];
-      if (mine === undefined || theirs === undefined) { this.stall++; return; }
-      this.stall = 0;
-      const p1 = this.isHost ? mine : theirs, p2 = this.isHost ? theirs : mine;
-      match.inputs = [decodeInput(p1), decodeInput(p2)];
-      match.update();
-      delete this.localInputs[f]; delete this.remoteInputs[f];
-      this.simFrame++;
-      if (this.simFrame % 60 === 0) this.sendChecksum(match);
-      if (Game.screen !== 'onlineFight') return;     // the match just ended
-      // 3. only run a second frame if we have fallen behind the rival
-      if (this.remoteMax - this.simFrame <= this.delay) return;
     }
   },
 
-  // Once a second both games compare a summary of the fighters. They should
-  // always match; if not, something made the two games drift apart.
-  sendChecksum(match) {
-    const s = match.fighters.map(f => [f.x, f.y, f.vx, f.vy, f.percent, f.stocks, f.state].join(',')).join('|');
-    this.send({ t: 'sum', m: this.matchId, f: this.simFrame, s });
-    this.recordSum(this.simFrame, s, 'mine');
+  // Send my buttons for every frame up to "delay" frames ahead.
+  sendInputs() {
+    while (this.sendFrame <= this.frame + this.delay) {
+      const bits = this.menuOpen ? 0 : (readLocalBits() & HELD_BITS) | this.latch;
+      this.latch = 0;
+      this.localInputs[this.sendFrame] = bits;
+      this.sendFast({ t: 'in', m: this.matchId, f: this.sendFrame, b: bits, cf: this.frame, ahead: this.frame - this.remoteFrame });
+      this.sendFrame++;
+    }
   },
+
+  // Called once per game update while an online match is on screen.
+  tick() {
+    this.tickCount++;
+    // remember presses until they are sent, so a quick tap is never lost
+    if (!this.menuOpen) this.latch |= readLocalBits() & ~HELD_BITS;
+    if (this.rollbackFrom < this.frame) this.rollback();
+    this.confirmFrames();
+    const match = Game.match;
+    if (match.over) {                                 // match finished: show results once it's final
+      if (this.confirmed >= this.frame) { Game.lastResult = match.result; Game.setScreen('results'); }
+      return;
+    }
+    // Stay in step: both games say how far ahead of the other they seem to be
+    // (message travel time makes both numbers too big by the same amount, so
+    // half the difference is the real gap). The one that's ahead skips a frame
+    // now and then so the other can catch up.
+    const ahead = ((this.frame - this.remoteFrame) - this.remoteAhead) / 2;
+    this.aheadAvg += (ahead - this.aheadAvg) * 0.05;  // smoothed, so random message wobble doesn't count
+    if (this.aheadAvg > 1 && this.tickCount % 4 === 0) return;
+    if (this.frame - this.confirmed >= MAX_PREDICT) { this.stall++; return; }   // too far ahead of what we know
+    this.sendInputs();
+    this.runFrame(false);
+    this.stall = 0;
+  },
+
+  // Once a second (of confirmed frames) both games compare a summary of the
+  // match. They should always match; if not, the two games drifted apart.
   recordSum(frame, s, whose) {
     const entry = this.sums[frame] || (this.sums[frame] = {});
     entry[whose] = s;
@@ -5070,7 +5541,8 @@ SCREENS.onlineLobby = {
     drawText(c, status, W / 2, 636, { size: 22, color: Net.me.ready ? '#7dff9a' : '#ffffff', stroke: 4 });
     const k = CONTROLS[0];
     drawText(c, keyName(k.left) + '/' + keyName(k.right) + ' or click = choose  ·  ' + keyName(k.attack) + ' / ' + keyName(k.jump) +
-      ' / Enter = ready  ·  ' + keyName(k.special) + ' = cancel  ·  Esc = leave room', W / 2, 700, { size: 14, weight: 'normal', color: '#b7a8dc' });
+      ' / Enter = ready  ·  ' + keyName(k.special) + ' = cancel  ·  ' +
+      (Net.isHost ? keyName(k.up) + '/' + keyName(k.down) + ' = stage  ·  ' : '') + 'Esc = leave room', W / 2, 700, { size: 14, weight: 'normal', color: '#b7a8dc' });
   },
 };
 
@@ -5096,7 +5568,8 @@ SCREENS.onlineFight = {
   },
   draw(c) {
     Game.match.draw(c);
-    drawText(c, 'ping ' + Math.round(Net.rtt) + ' ms', 12, 20, { size: 14, align: 'left', weight: 'normal', color: '#ffffff', stroke: 3 });
+    drawText(c, 'ping ' + Math.round(Net.rtt) + ' ms' + (DEBUG ? '  ·  delay ' + Net.delay + '  ·  guessing ' + (Net.frame - Net.confirmed) + ' frames  ·  rollbacks ' + Net.rollbacks : ''),
+      12, DEBUG ? 40 : 20, { size: 14, align: 'left', weight: 'normal', color: '#ffffff', stroke: 3 });
     if (Net.desync) {
       drawText(c, 'Out of sync! Your screens may not match - try a rematch (both using the same browser helps).', W / 2, 20,
         { size: 15, color: '#ffb347', stroke: 3 });

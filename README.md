@@ -1,6 +1,6 @@
 # Elemental Clash
 
-A 2-player platform fighter that runs in your browser — on one keyboard, or **online with a room code**. Five elemental fighters, one floating shrine, three stocks each. The higher your damage %, the farther you fly — knock your rival past the edge of the screen to take a stock.
+A 2-player platform fighter that runs in your browser — on one keyboard, or **online with a room code**. Five elemental fighters, three stages, three stocks each. The higher your damage %, the farther you fly — knock your rival past the edge of the screen to take a stock.
 
 Everything — characters, stage, effects and sound — is drawn and synthesized with code. No images, no audio files. Just one HTML file (online play loads one small library, [PeerJS](https://peerjs.com/), to connect the two browsers).
 
@@ -17,7 +17,15 @@ Everything — characters, stage, effects and sound — is drawn and synthesized
 
 The host is Player 1 (red) and the friend is Player 2 (blue). Online, **each player uses their own Player 1 controls**, which can be changed from the room's ⚙ CONTROLS button before the fight. Online matches can't be paused: `Esc` opens a menu while the fight keeps going.
 
-How it works: the two browsers connect directly with WebRTC (PeerJS's free server only introduces them). Both computers run the same match with the same button presses ("lockstep"). Your presses are delayed by a few frames, picked from the ping, so the rival's buttons arrive in time. Both players need an internet connection and should use the same version of the page.
+How it works: the two browsers connect directly with WebRTC (PeerJS's free server only introduces them). Both computers run the same match with the same button presses, using **rollback netcode**: your own buttons work right away, and the game guesses the rival's buttons until they arrive. If a guess was wrong, it rewinds to a saved copy of the match and quickly replays the last few frames with the real buttons, so the game never freezes to wait. Both players need an internet connection and should use the same version of the page. Turn on hitbox view (`` ` ``) in an online match to see the ping, input delay and rollback count.
+
+## Stages
+
+| Stage | What it's like |
+|---|---|
+| **Elemental Shrine** | Balanced: a floating temple with three platforms |
+| **Magma Forge** | A long iron bridge over lava with two low grates — lots of room to fight |
+| **Storm Spire** | A tiny peak in a thunderstorm, with platforms hanging past the edges — early KOs |
 
 ## Fighters
 
@@ -39,10 +47,13 @@ How it works: the two browsers connect directly with WebRTC (PeerJS's free serve
 | Attack (hold to charge) | **Left Click** | . |
 | Special | Right Click | / |
 | Shield (hold) / Dodge (tap) | Left Shift | Right Shift |
+| Grab | E | , |
 
 Every key can be changed on the **CONTROLS** screen (from the home menu, the ⚙ CONTROLS button on character select or in an online room, or the pause menu). Bindings are saved in your browser.
 
 Hold a direction while attacking for tilts and aerials. **Up + Special** is always a recovery. Grab ledges to get back on stage.
+
+**Grabs:** press Grab next to your rival (it goes through shields, and works out of shield too). While holding them, press a direction to throw (forward, back, up, or down — down throw pops them up for a combo), or Attack to pummel. If you're grabbed, mash any button to break free sooner. In the air, Grab does an aerial.
 
 `Esc` pause · `` ` `` show hitboxes · `M` mute
 
@@ -73,6 +84,7 @@ knockback = base + (percent × scaling × damage / 10) × (100 / (weight + 100))
 ## Ideas / roadmap
 
 - [ ] New fighters: Earth, Wind, Ice
-- [ ] More stages
+- [x] More stages (Magma Forge, Storm Spire)
+- [ ] Even more stages
 - [ ] Gamepad support
 - [ ] CPU opponent
